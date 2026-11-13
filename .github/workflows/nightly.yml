@@ -677,13 +677,14 @@ jobs:
           name: e2e-gpu-mi350p-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
-  # W7900 counterpart to e2e-gpu-nightly. Mirrors the e2e-gpu-w7900 lane (which
-  # no longer runs on pull_request) in e2e-selfhosted.yml (w7900 label, shared
-  # uv cache, GPU preflight), with @nightly scenarios enabled. Keep the two in
-  # step. xtask's
+  # W7900 counterpart to e2e-gpu-nightly (w7900 label, shared uv cache, GPU
+  # preflight), with @nightly scenarios enabled. e2e-selfhosted.yml has no W7900
+  # lane any more, so there is no per-PR counterpart to keep in step with;
+  # outside this lane W7900 runs only in the scheduled queue nightly's
+  # `w7900-dual` lane (docs/nightly-on-the-queue.md). xtask's
   # `the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes` asserts
-  # only that nightly covers every platform e2e-selfhosted.yml publishes, not
-  # that the lanes agree.
+  # only that nightly covers every platform e2e-selfhosted.yml publishes,
+  # which this lane adds to.
   e2e-gpu-nightly-w7900:
     name: E2E tests (W7900, incl. nightly-only)
     timeout-minutes: 90
@@ -713,8 +714,8 @@ jobs:
       # process survives. The floor stays at the shared 16 GiB default, which is
       # a flat constant rather than a proportion of capacity: it only has to be
       # high enough to catch a leftover serve still holding the card, and low
-      # enough that a clean host passes on the first poll. Same as e2e-gpu-w7900
-      # in e2e-selfhosted.yml — do NOT scale it down for a smaller part. On a 48GB card it
+      # enough that a clean host passes on the first poll — do NOT scale it
+      # down for a smaller part. On a 48GB card it
       # only trips past ~32 GiB held, so the process gate is what catches a
       # leftover serve holding less (#446). See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)

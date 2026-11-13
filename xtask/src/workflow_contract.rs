@@ -4887,31 +4887,6 @@ fi
         );
     }
 
-    /// The lanes allowed to be masked, per workflow: for a listed lane, every
-    /// line `continue_on_error_lines` reports is permitted, on the job or on a
-    /// step.
-    ///
-    /// A job-level `continue-on-error: true` does more than keep the run going:
-    /// a failed leg then reads `success` in `needs.<lane>.result` downstream and
-    /// in the run's conclusion, so a broken lane is indistinguishable from a
-    /// passing one everywhere but its own log. The nightly lanes run in separate
-    /// jobs with `fail-fast: false` and the report job runs on `always()`, so
-    /// masking them bought nothing.
-    ///
-    /// `e2e-gpu-w7900` in e2e-selfhosted.yml is the one deliberate exception.
-    /// That workflow's header and the lane's own comment keep it masked only
-    /// while the hardware is proven out, to be flipped to `false` once it has a
-    /// track record. Its nightly counterpart, `e2e-gpu-nightly-w7900`, runs
-    /// unmasked. When the e2e-selfhosted.yml lane is flipped, drop it from this
-    /// list too.
-    fn masked_e2e_lanes(workflow: &str) -> &'static [&'static str] {
-        match workflow {
-            "e2e-selfhosted.yml" => &["e2e-gpu-w7900"],
-            "nightly.yml" => &[],
-            other => panic!("no masked-lane policy known for {other}"),
-        }
-    }
-
     /// Every line of a self-hosted lane's job block in `text` that may set
     /// `continue-on-error` to anything but `false`, as `job: line` (the line
     /// trimmed), lanes and lines in file order.
@@ -4959,112 +4934,59 @@ fi
             .collect()
     }
 
-    /// The self-hosted lanes in `text` with at least one line
-    /// `continue_on_error_lines` reports, in file order, each once.
-    fn masked_lanes(text: &str) -> Vec<String> {
-        let mut lanes: Vec<String> = Vec::new();
-        for line in continue_on_error_lines(text) {
-            let (job, _) = line
-                .split_once(": ")
-                .expect("each line is labelled `job: line`");
-            if !lanes.iter().any(|lane| lane == job) {
-                lanes.push(job.to_owned());
-            }
+    /// Why `text` (the workflow named `workflow`) breaks the no-mask rule, as
+    /// one message listing every line `continue_on_error_lines` reports, as
+    /// `job: line`; `None` when no self-hosted E2E lane has such a line.
+    ///
+    /// A job-level `continue-on-error: true` does more than keep the run going:
+    /// a failed leg then reads `success` in `needs.<lane>.result` downstream and
+    /// in the run's conclusion, so a broken lane is indistinguishable from a
+    /// passing one everywhere but its own log. A step-level one lets the
+    /// failing step pass the job. The lanes run in separate jobs with
+    /// `fail-fast: false`, and each workflow's consolidated report job is gated
+    /// on `always()`, so an unmasked failure neither cancels a sibling lane nor
+    /// skips the report.
+    fn mask_failure(workflow: &str, text: &str) -> Option<String> {
+        let lines = continue_on_error_lines(text);
+        if lines.is_empty() {
+            return None;
         }
-        lanes
-    }
-
-    /// `(masked but not allowed, allowed but no longer masked)`.
-    fn mask_policy_violations<'a>(
-        masked: &'a [String],
-        allowed: &'a [&'a str],
-    ) -> (Vec<&'a str>, Vec<&'a str>) {
-        let unexpected = masked
-            .iter()
-            .map(String::as_str)
-            .filter(|job| !allowed.contains(job))
-            .collect();
-        let stale = allowed
-            .iter()
-            .copied()
-            .filter(|job| !masked.iter().any(|m| m == job))
-            .collect();
-        (unexpected, stale)
-    }
-
-    /// Every way `text` (the workflow named `workflow`) breaks its masked-lane
-    /// policy, as messages: a lane `continue_on_error_lines` reports that
-    /// `allowed` does not list, and an `allowed` entry that is no longer
-    /// masked. Empty when the policy holds.
-    fn mask_policy_failures(workflow: &str, text: &str, allowed: &[&str]) -> Vec<String> {
-        let masked = masked_lanes(text);
-        let (unexpected, stale) = mask_policy_violations(&masked, allowed);
-        // Only the offending lanes' lines; an allowed lane's are permitted.
-        let lines: Vec<String> = continue_on_error_lines(text)
-            .into_iter()
-            .filter(|line| {
-                line.split_once(": ")
-                    .is_some_and(|(job, _)| unexpected.contains(&job))
-            })
-            .collect();
-        let mut failures = Vec::new();
-        if !unexpected.is_empty() {
-            failures.push(format!(
-                "{workflow}: these self-hosted E2E lanes may set `continue-on-error` to \
-                 something other than `false`, on the job or on a step: {unexpected:?}, \
-                 from these lines: {lines:?}. On the job that makes a failed lane read \
-                 `success` in `needs.<lane>.result` and in the run's conclusion; on a step \
-                 it lets the failing step pass the job. Either way the run goes green \
-                 while the lane is red. Remove it, or reword a script that only mentions \
-                 the key (this scan is deliberately fail-closed). If a lane really must be \
-                 non-blocking while its hardware is proven out, document why in the \
-                 workflow and add it to `masked_e2e_lanes`"
-            ));
-        }
-        if !stale.is_empty() {
-            failures.push(format!(
-                "{workflow}: `masked_e2e_lanes` still lists {stale:?}, which no longer \
-                 set `continue-on-error` to anything but `false` (or are no longer \
-                 self-hosted lanes). Drop them from `masked_e2e_lanes`, and from the \
-                 workflow's header comment and docs/ci-hardware-testing.md where they are \
-                 named as the masked exception"
-            ));
-        }
-        failures
+        Some(format!(
+            "{workflow}: self-hosted E2E lanes may set `continue-on-error` to something \
+             other than `false`, on the job or on a step, in these lines: {lines:?}. On the \
+             job that makes a failed lane read `success` in `needs.<lane>.result` and in \
+             the run's conclusion; on a step it lets the failing step pass the job. Either \
+             way the run goes green while the lane is red. Remove it, or reword a script \
+             that only mentions the key (this scan is deliberately fail-closed)"
+        ))
     }
 
     #[test]
-    fn mask_policy_failures_reports_an_unexpected_mask_and_a_stale_entry() {
-        let masked = one_lane_workflow("    continue-on-error: true\n");
-        let unmasked = one_lane_workflow("    continue-on-error: false\n");
-
-        let failures = mask_policy_failures("w.yml", &masked, &[]);
-        assert_eq!(failures.len(), 1, "{failures:?}");
+    fn mask_failure_names_every_masked_line_and_passes_an_unmasked_workflow() {
+        // Two lanes: one masked on the job and on a step, one explicitly unmasked.
+        let workflow = "on: push\njobs:\n  quiet:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: false\n  loud:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: ${{ true }}\n    steps:\n      - continue-on-error: true\n";
+        let failure = mask_failure("w.yml", workflow).expect("a masked lane must fail");
         assert!(
-            failures[0].contains("may set `continue-on-error`")
-                && failures[0].contains("[\"lane\"]")
-                && failures[0].contains("lane: continue-on-error: true"),
-            "{failures:?}"
+            failure.starts_with("w.yml: ")
+                && failure.contains("\"loud: continue-on-error: ${{ true }}\"")
+                && failure.contains("\"loud: - continue-on-error: true\"")
+                && !failure.contains("quiet"),
+            "{failure}"
         );
 
-        let failures = mask_policy_failures("w.yml", &unmasked, &["lane"]);
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].contains("still lists [\"lane\"]"),
-            "{failures:?}"
+        assert_eq!(
+            mask_failure(
+                "w.yml",
+                &one_lane_workflow("    continue-on-error: false\n")
+            ),
+            None
         );
-
-        assert!(mask_policy_failures("w.yml", &masked, &["lane"]).is_empty());
-        assert!(mask_policy_failures("w.yml", &unmasked, &[]).is_empty());
-
-        // An allowed lane's lines stay out of another lane's message.
-        let two_lanes = "on: push\njobs:\n  allowed:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: true\n  loud:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: ${{ true }}\n";
-        let failures = mask_policy_failures("w.yml", two_lanes, &["allowed"]);
-        assert_eq!(failures.len(), 1, "{failures:?}");
-        assert!(
-            failures[0].contains("loud: continue-on-error: ${{ true }}")
-                && !failures[0].contains("allowed: continue-on-error: true"),
-            "{failures:?}"
+        assert_eq!(
+            mask_failure(
+                "w.yml",
+                &one_lane_workflow("    steps:\n      - run: echo\n")
+            ),
+            None
         );
     }
 
@@ -5159,19 +5081,6 @@ fi
     }
 
     #[test]
-    fn masked_lanes_and_policy_violations() {
-        let two_lanes = "on: push\njobs:\n  quiet:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: false\n  loud:\n    runs-on: [self-hosted, linux, mi300x]\n    continue-on-error: true\n    steps:\n      - continue-on-error: true\n";
-        assert_eq!(masked_lanes(two_lanes), ["loud"], "a lane is listed once");
-
-        let masked = vec!["a".to_owned(), "b".to_owned()];
-        let (unexpected, stale) = mask_policy_violations(&masked, &["b", "c"]);
-        assert_eq!(unexpected, ["a"], "masked but not allowed");
-        assert_eq!(stale, ["c"], "allowed but no longer masked");
-        let (unexpected, stale) = mask_policy_violations(&masked, &["a", "b"]);
-        assert!(unexpected.is_empty() && stale.is_empty());
-    }
-
-    #[test]
     fn e2e_lanes_do_not_mask_failures_with_continue_on_error() {
         for (workflow, text) in self_hosted_workflows() {
             let lanes = self_hosted_e2e_jobs(&text);
@@ -5187,8 +5096,9 @@ fi
                 "{workflow}: found no `{expected_lane}` among its self-hosted lanes {lanes:?}, \
                  so nothing below would be checked"
             );
-            let failures = mask_policy_failures(workflow, &text, masked_e2e_lanes(workflow));
-            assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+            if let Some(failure) = mask_failure(workflow, &text) {
+                panic!("{failure}");
+            }
         }
 
         // With the lanes unmasked, a failed lane fails its job, and the default

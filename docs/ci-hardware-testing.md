@@ -578,13 +578,12 @@ The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
 `e2e-gpu-strix-windows`, and `e2e-wsl` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
-it reports. In `e2e-selfhosted.yml` they run with `continue-on-error: false`,
-so a real regression shows red instead of always green. Their results also surface in
-the self-hosted consolidated report for visibility. A lane that ran but uploaded
-no report (it died before writing its results) fails the consolidated report
-job, naming the lane, rather than silently dropping out of the grid; on the
-`continue-on-error: true` lane that is the only red signal for such a failure.
-The nightly report job applies the same check to every nightly lane.
+it reports. Each sets `continue-on-error: false`, so a real regression shows
+red instead of always green. Their results also surface in the self-hosted
+consolidated report for visibility. A lane that ran but uploaded no report (it
+died before writing its results) fails the consolidated report job, naming the
+lane, rather than silently dropping out of the grid. The nightly report job
+applies the same check to every nightly lane.
 
 No E2E lane in [`nightly.yml`](../.github/workflows/nightly.yml) sets
 `continue-on-error`, on the job or on any step, `e2e-gpu-nightly-w7900` and
@@ -593,11 +592,8 @@ whole Nightly run red. (Two non-lane jobs, `release-readiness-narrative` and
 `publish-release-readiness-wiki`, still use it.) Job-level
 `continue-on-error: true` would instead make the failed lane read `success`,
 both in `needs.<lane>.result` and in the run's conclusion, and a step-level one
-would let the failing step pass the job. In `e2e-selfhosted.yml`,
-`e2e-gpu-w7900` (which no longer runs on pull requests) stays masked only while
-that hardware is proven out (see the header of
-[`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)); its nightly
-counterpart runs unmasked. Nightly gates no merge or tag either way. On a red
+would let the failing step pass the job. Nightly gates no merge or tag either
+way. On a red
 night the consolidated report and release-readiness jobs still run, and the E2E
 wiki page is updated only when `e2e-report-nightly` succeeded and
 `publish-e2e-wiki`'s other guards hold; the report job fails, for example, when
@@ -607,10 +603,11 @@ a lane that ran uploaded no report, and then the previous page stays in place.
 line scan of every self-hosted lane in both workflows that is fail-closed for
 the spellings it reads: outside comments, any line mentioning
 `continue-on-error` that is not exactly `continue-on-error: false` (or
-`- continue-on-error: false`) marks the lane masked, even inside a `run:`
-script. What it cannot see, including spellings it misses, is listed in the
-`continue_on_error_lines` doc comment. The masked set must be empty for nightly
-and exactly `e2e-gpu-w7900` in `e2e-selfhosted.yml`.
+`- continue-on-error: false`) fails the test, even inside a `run:` script, and
+the failure names each such line with its lane. There is no exception list: no
+self-hosted E2E lane in either workflow may carry such a line. What the scan
+cannot see, including spellings it misses, is listed in the
+`continue_on_error_lines` doc comment.
 
 ### Timeouts on the Strix lanes
 
