@@ -713,8 +713,8 @@ jobs:
       # process survives. The floor stays at the shared 16 GiB default, which is
       # a flat constant rather than a proportion of capacity: it only has to be
       # high enough to catch a leftover serve still holding the card, and low
-      # enough that a clean host passes on the first poll. Same as the per-PR
-      # W7900 lane — do NOT scale it down for a smaller part. On a 48GB card it
+      # enough that a clean host passes on the first poll. Same as e2e-gpu-w7900
+      # in e2e-selfhosted.yml — do NOT scale it down for a smaller part. On a 48GB card it
       # only trips past ~32 GiB held, so the process gate is what catches a
       # leftover serve holding less (#446). See .github/scripts/gpu-preflight.sh.
       - name: GPU preflight (bounded wait for an available GPU)

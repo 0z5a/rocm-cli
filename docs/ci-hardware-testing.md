@@ -594,7 +594,8 @@ whole Nightly run red. (Two non-lane jobs, `release-readiness-narrative` and
 `continue-on-error: true` would instead make the failed lane read `success`,
 both in `needs.<lane>.result` and in the run's conclusion, and a step-level one
 would let the failing step pass the job. In `e2e-selfhosted.yml`,
-`e2e-gpu-w7900` (which no longer runs on pull requests) stays masked only while that hardware is proven out (see the header of
+`e2e-gpu-w7900` (which no longer runs on pull requests) stays masked only while
+that hardware is proven out (see the header of
 [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)); its nightly
 counterpart runs unmasked. Nightly gates no merge or tag either way. On a red
 night the consolidated report and release-readiness jobs still run, and the E2E
@@ -607,8 +608,7 @@ line scan of every self-hosted lane in both workflows that is fail-closed for
 the spellings it reads: outside comments, any line mentioning
 `continue-on-error` that is not exactly `continue-on-error: false` (or
 `- continue-on-error: false`) marks the lane masked, even inside a `run:`
-script. Its limits (each line is cut at ` #`, the match is case-sensitive, and
-merge keys from outside the job are not followed) are listed in the
+script. What it cannot see, including spellings it misses, is listed in the
 `continue_on_error_lines` doc comment. The masked set must be empty for nightly
 and exactly `e2e-gpu-w7900` in `e2e-selfhosted.yml`.
 
