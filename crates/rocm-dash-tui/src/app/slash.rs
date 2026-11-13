@@ -1255,6 +1255,29 @@ mod tests {
         );
     }
 
+    /// An unknown flag is refused on its own, with no mode flag, and it wins
+    /// over the `--apply`/`--dry-run` conflict: the typo is named, so the user
+    /// fixes it first. Neither raises a request.
+    #[test]
+    fn slash_uninstall_unknown_flag_alone_or_with_conflicting_modes_is_named() {
+        let mut s = st();
+        for command in [
+            "/uninstall --keep-dat",
+            "/uninstall --apply --dry-run --keep-dat",
+        ] {
+            assert_eq!(s.handle_slash_command(command), SlashOutcome::Handled);
+            assert!(s.slash_tool.is_none(), "{command} raised a request");
+            let turn = s.chat.last().expect("an error turn");
+            assert_eq!(turn.role, ChatRole::Error, "{command}");
+            assert!(
+                turn.content
+                    .starts_with("unknown /uninstall flag --keep-dat:"),
+                "{command}: {}",
+                turn.content
+            );
+        }
+    }
+
     #[test]
     fn slash_uninstall_conflicting_flags_is_guided() {
         let mut s = st();

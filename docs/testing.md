@@ -1839,7 +1839,7 @@ with Ctrl-D, and for a plain no, each together with the config folder being left
 in place. They run on the default mock lane; the helper's other callers (`rocm fix`,
 the SDK-overwrite prompt) share it and are covered by its unit tests in
 [confirm.rs](../crates/rocm-core/src/confirm.rs).
-`uninstall-16` to `uninstall-21` cover the protected-location refusal: the top
+`uninstall-16` to `uninstall-22` cover the protected-location refusal: the top
 of the filesystem as the data folder, refused in a dry run (`uninstall-16`); the
 home folder, refused with the home file and config folder left in place, saying
 ROCm CLI never removes that folder, and the advised `--keep-data` then
@@ -1848,9 +1848,11 @@ cache folder named as deleted, then kept by `--keep-cache` and really deleted
 without it (`uninstall-18`); a data folder of `.` run from home, refused with
 nothing removed (`uninstall-19`); an unmarked folder outside home, refused with
 it left in place and without a claim that it is never removed, then, once the
-marker the refusal names is created, planned and really removed (`uninstall-20`); and the
+marker the refusal names is created, planned and really removed (`uninstall-20`); the
 dashboard's approved-command path naming `setup.therock_venv`, with the home
-file and config folder left in place (`uninstall-21`).
+file and config folder left in place (`uninstall-21`); and a data setting naming
+a file through a home-folder link to `/proc`, refused as the system file it
+really is with the config folder left in place (`uninstall-22`).
 The `uninstall` command does not start the file logger, which would otherwise
 create the data folder's `logs` folder before the plan is built:
 

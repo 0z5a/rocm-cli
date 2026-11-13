@@ -2660,6 +2660,34 @@ mod tests {
         );
     }
 
+    /// The assistant may not install the SDK into the home folder itself, which
+    /// a later uninstall or venv rebuild would remove, and the refusal says
+    /// why; a folder inside home is still accepted. Through the shared check
+    /// and through the `rocm install sdk` command a model's call goes by.
+    #[test]
+    fn the_assistant_cannot_install_into_the_home_folder_itself() {
+        use crate::test_support::owned_argv;
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        assert_eq!(
+            chat_install_prefix_protection(&home),
+            Some("your home folder")
+        );
+        assert_eq!(chat_install_prefix_protection(&home.join("rocm")), None);
+
+        let home_text = home.display().to_string();
+        let error = validate_chat_rocm_command_safety(&owned_argv(&[
+            "install", "sdk", "--format", "wheel", "--prefix", &home_text,
+        ]))
+        .expect_err("the home folder as install folder must be refused")
+        .to_string();
+        assert!(error.contains("it is your home folder"), "{error}");
+        let inside = home.join("rocm").display().to_string();
+        validate_chat_rocm_command_safety(&owned_argv(&[
+            "install", "sdk", "--format", "wheel", "--prefix", &inside,
+        ]))
+        .expect("a folder inside home is a valid install folder");
+    }
+
     /// The serve safety rules as the chat assistant meets them: every refusal in
     /// the shared table, through the safety check itself and through the two
     /// entry points a model's `rocm_command` call goes by. A refused call yields

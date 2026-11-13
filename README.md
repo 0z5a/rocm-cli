@@ -1883,7 +1883,11 @@ or one some other command happened to create first is not marked, and is
 refused rather than removed until you create the file or keep the folder. The check looks at where a folder really is as well as how it is
 written, so `ROCM_CLI_DATA_DIR=.` run from your home folder, a home reached
 through a linked parent folder, or a system folder reached through a link is
-caught too.
+caught too. A setting that names a file or a link rather than a folder is
+judged by where its folder really is: with `~/x` a link to `/etc`,
+`~/x/config.json` is refused as `/etc/config.json`. The link itself is only
+unlinked, never followed. If a system folder that exists cannot be resolved,
+nothing can be judged against it, so the uninstall is refused as unresolvable.
 
 If a folder is refused (for example `ROCM_CLI_DATA_DIR=/`, or an SDK installed
 with `--prefix ~`), the review lists it under "Refused" with why and the

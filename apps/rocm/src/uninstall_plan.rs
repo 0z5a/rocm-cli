@@ -292,9 +292,10 @@ pub(crate) enum RootJudgment {
 }
 
 /// Judge the root `path` by [`rocm_core::uninstall_root_verdict`]: on its
-/// spelling first, then — for a real directory, the only kind removed
-/// recursively — on where it really is against where home and the system
-/// locations really are. `.` run from home, `..` run from `~/proj`, home
+/// spelling first, then on where it really is against where home and the
+/// system locations really are — a real directory, the only kind removed
+/// recursively, as a whole; a file or link by its resolved folder and its own
+/// name. `.` run from home, `..` run from `~/proj`, home
 /// reached through a symlinked parent (`/home -> var/home`), or `/usr/lib`
 /// where `/lib -> usr/lib`, name a protected place without spelling it.
 /// A real directory outside the home folder must also carry the marker.
@@ -316,9 +317,39 @@ pub(crate) fn judge_uninstall_root(
             real: None,
         };
     }
-    // `symlink_metadata`: a symlinked root is unlinked, never walked, and a
-    // file is just a file.
+    let unresolvable = RootJudgment::Refuse {
+        why: ProtectedLocation::Unresolvable,
+        shown: None,
+        real: None,
+    };
+    let resolved_home = home.map(|home| {
+        canonicalize(home).unwrap_or_else(|_| rocm_core::resolve_path_through_symlinks(home))
+    });
+    // A system location that exists but cannot be resolved would drop out of
+    // the comparison and leave its real location unprotected: refuse instead.
+    let Some(resolved_system_roots) = resolved_system_roots(canonicalize) else {
+        return unresolvable;
+    };
+    // `symlink_metadata`: a non-directory root is unlinked, never walked, so
+    // the link itself is not followed. The folders above it are, by the OS,
+    // so it is judged by where its folder really is: `~/x/config.json` with
+    // `~/x -> /etc` is `/etc/config.json`. Only a refusal counts here; a file
+    // holds no marker, so anything else is unlinked as before.
     if !metadata.is_dir() {
+        let Some(real) = real_location_of_non_dir(path, canonicalize) else {
+            return unresolvable;
+        };
+        if let UninstallRootVerdict::Refused(why) = rocm_core::uninstall_root_verdict(
+            &real,
+            resolved_home.as_deref(),
+            &resolved_system_roots,
+        ) {
+            return RootJudgment::Refuse {
+                why,
+                shown: (real != path).then(|| real.clone()),
+                real: Some(real),
+            };
+        }
         return RootJudgment::Remove {
             planned: PlannedAs::non_dir(path, metadata, canonicalize),
         };
@@ -326,19 +357,8 @@ pub(crate) fn judge_uninstall_root(
     // A directory that cannot be resolved cannot be judged by where it is, and
     // is about to be walked recursively: refuse rather than guess.
     let Ok(resolved) = canonicalize(path) else {
-        return RootJudgment::Refuse {
-            why: ProtectedLocation::Unresolvable,
-            shown: None,
-            real: None,
-        };
+        return unresolvable;
     };
-    let resolved_home = home.map(|home| {
-        canonicalize(home).unwrap_or_else(|_| rocm_core::resolve_path_through_symlinks(home))
-    });
-    let resolved_system_roots = rocm_core::uninstall_system_roots()
-        .iter()
-        .filter_map(|root| canonicalize(root).ok())
-        .collect::<Vec<_>>();
     let shown = (resolved != path).then(|| resolved.clone());
     let refuse = |why| RootJudgment::Refuse {
         why,
@@ -358,6 +378,32 @@ pub(crate) fn judge_uninstall_root(
             planned: PlannedAs::Dir(resolved),
         },
     }
+}
+
+/// Where each of [`rocm_core::uninstall_system_roots`] really is. One that
+/// does not exist protects nothing and is left out; `None` when one exists but
+/// cannot be resolved.
+fn resolved_system_roots(canonicalize: Canonicalize<'_>) -> Option<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for root in rocm_core::uninstall_system_roots() {
+        match canonicalize(&root) {
+            Ok(real) => resolved.push(real),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(resolved)
+}
+
+/// A non-directory `path` with its folder resolved and its own name kept, so
+/// a link root stays the link; `None` when the folder cannot be resolved.
+fn real_location_of_non_dir(path: &Path, canonicalize: Canonicalize<'_>) -> Option<PathBuf> {
+    let name = path.file_name()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    canonicalize(parent).ok().map(|parent| parent.join(name))
 }
 
 /// Whether `dir` carries the marker as a regular file of its own. A link named
@@ -1549,7 +1595,9 @@ mod tests {
     }
 
     /// The refusal names where the folder came from, and points at that
-    /// setting as well as at the `--keep-` flag.
+    /// setting as well as at the `--keep-` flag. This pins the wording only:
+    /// `pointing_the_named_variable_elsewhere_clears_the_refusal` shows the
+    /// named variable clears it, and `uninstall-17` the named flag.
     #[test]
     fn a_refusal_names_the_setting_the_folder_came_from() {
         let root = std::env::temp_dir().join(format!("rocm-refuse-source-{}", std::process::id()));
@@ -2052,6 +2100,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(plan.refused.len(), 1, "{plan:?}");
         assert_eq!(plan.refused[0].why, rocm_core::ProtectedLocation::System);
+    }
+
+    /// A file root spelled inside home but reached through a linked folder is
+    /// judged by where its folder really is: `~/x/conf` with `~/x` linked to a
+    /// system location is that location's `conf`, and the plan refuses it
+    /// rather than unlinking a file there. The system location is a sandbox
+    /// folder the injected resolver reports as `/etc`'s real place.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_root_reached_through_a_linked_folder_is_judged_where_it_really_is() {
+        let root = sandbox("file-through-link");
+        let home = root.join("users").join("home");
+        let real_etc = root.join("real-etc");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&real_etc).unwrap();
+        std::fs::write(real_etc.join("conf"), b"system").unwrap();
+        std::os::unix::fs::symlink(&real_etc, home.join("x")).unwrap();
+        let etc_target = real_etc.clone();
+        let resolve: &dyn Fn(&Path) -> std::io::Result<PathBuf> = &move |path: &Path| {
+            if path == Path::new("/etc") {
+                Ok(etc_target.clone())
+            } else {
+                rocm_core::canonicalize_for_compare(path)
+            }
+        };
+        let plan = super::build_uninstall_plan_with(
+            &data_only(home.join("x").join("conf"), &root),
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+            resolve,
+        )
+        .unwrap();
+        let kept = real_etc.join("conf").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(plan.actions.is_empty(), "{plan:?}");
+        assert_eq!(plan.refused.len(), 1, "{plan:?}");
+        assert_eq!(plan.refused[0].why, rocm_core::ProtectedLocation::System);
+        assert_eq!(
+            plan.refused[0].resolved.as_deref(),
+            Some(real_etc.join("conf").as_path())
+        );
+        assert!(kept);
+    }
+
+    /// The same layout with the link pointing at another folder in home plans
+    /// the file as before, and a root that is itself a link stays the link:
+    /// only its folder is resolved, so the plan unlinks the link and does not
+    /// reach the folder it points at.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_or_link_root_whose_folder_really_is_in_home_is_planned() {
+        let root = sandbox("file-link-in-home");
+        let home = root.join("users").join("home");
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("conf"), b"mine").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join("x")).unwrap();
+        let file = super::build_uninstall_plan_for_home(
+            &data_only(home.join("x").join("conf"), &root),
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        let link = super::build_uninstall_plan_for_home(
+            &data_only(home.join("x"), &root),
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(file.refused.is_empty(), "{file:?}");
+        assert_eq!(file.actions.len(), 1, "{file:?}");
+        assert!(link.refused.is_empty(), "{link:?}");
+        assert_eq!(link.actions.len(), 1, "{link:?}");
+        assert_eq!(link.actions[0].path, home.join("x"), "{link:?}");
+        assert!(
+            matches!(link.actions[0].planned, super::PlannedAs::Link { .. }),
+            "{link:?}"
+        );
+    }
+
+    /// A root that is itself a link stays the link: only its folder is
+    /// resolved, so a link in home pointing at a system location is planned
+    /// as the link, to be unlinked, not refused as the place it points at.
+    /// The system location is a sandbox folder the injected resolver reports
+    /// as `/etc`'s real place.
+    #[test]
+    #[cfg(unix)]
+    fn a_link_root_pointing_at_a_system_location_is_planned_as_the_link() {
+        let root = sandbox("link-to-system");
+        let home = root.join("users").join("home");
+        let real_etc = root.join("real-etc");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&real_etc).unwrap();
+        std::os::unix::fs::symlink(&real_etc, home.join("venv")).unwrap();
+        let etc_target = real_etc.clone();
+        let resolve: &dyn Fn(&Path) -> std::io::Result<PathBuf> = &move |path: &Path| {
+            if path == Path::new("/etc") {
+                Ok(etc_target.clone())
+            } else {
+                rocm_core::canonicalize_for_compare(path)
+            }
+        };
+        let plan = super::build_uninstall_plan_with(
+            &data_only(home.join("venv"), &root),
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+            resolve,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(plan.refused.is_empty(), "{plan:?}");
+        assert_eq!(plan.actions.len(), 1, "{plan:?}");
+        assert_eq!(plan.actions[0].path, home.join("venv"), "{plan:?}");
+        assert!(
+            matches!(plan.actions[0].planned, super::PlannedAs::Link { .. }),
+            "{plan:?}"
+        );
+    }
+
+    /// A system location that exists but cannot be resolved refuses the root
+    /// as unresolvable instead of dropping out of the comparison; one that
+    /// does not exist protects nothing and is skipped.
+    #[test]
+    fn a_system_location_that_cannot_be_resolved_refuses_the_root() {
+        let root = sandbox("system-root-unresolvable");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("data")).unwrap();
+        let system = rocm_core::uninstall_system_roots()[0].clone();
+        let plan_with = |kind: std::io::ErrorKind| {
+            let system = system.clone();
+            let resolve = move |path: &Path| {
+                if path == system {
+                    Err(std::io::Error::from(kind))
+                } else {
+                    rocm_core::canonicalize_for_compare(path)
+                }
+            };
+            super::build_uninstall_plan_with(
+                &data_only(home.join("data"), &root),
+                &rocm_core::AppPathSources::default(),
+                &keep_binaries(),
+                Some(&home),
+                &resolve,
+            )
+            .unwrap()
+        };
+        let denied = plan_with(std::io::ErrorKind::PermissionDenied);
+        let missing = plan_with(std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(denied.refused.len(), 1, "{denied:?}");
+        assert_eq!(
+            denied.refused[0].why,
+            rocm_core::ProtectedLocation::Unresolvable
+        );
+        assert!(denied.actions.is_empty(), "{denied:?}");
+        assert!(missing.refused.is_empty(), "{missing:?}");
+        assert_eq!(missing.actions.len(), 1, "{missing:?}");
     }
 
     /// A root spelled beside home that really is inside it — Windows spells the

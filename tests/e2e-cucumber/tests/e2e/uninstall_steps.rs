@@ -992,6 +992,49 @@ async fn unmarked_data_gone(world: &mut E2eWorld) {
     );
 }
 
+/// The link in the scenario's home that points at `/proc`.
+fn proc_link(world: &E2eWorld) -> PathBuf {
+    home(world).join("procfs")
+}
+
+#[given("the data folder setting names a file through a link in the home folder to /proc")]
+async fn data_is_file_through_proc_link(world: &mut E2eWorld) {
+    let link = proc_link(world);
+    std::fs::create_dir_all(home(world)).expect("failed to create HOME");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/proc", &link).expect("failed to link /proc");
+    set_env(world, "ROCM_CLI_DATA_DIR", link.join("version"));
+    // A config folder the uninstall would otherwise remove, so the refusal
+    // stopping everything shows in what is left.
+    plant_config_rocm_cli_created(world);
+}
+
+#[then("the refusal says that file really is in a protected system location")]
+async fn refusal_names_real_system_file(world: &mut E2eWorld) {
+    let stdout = output(world);
+    let line = format!(
+        "  - data: {} is a protected system location (set by ROCM_CLI_DATA_DIR; resolves to /proc/version)",
+        proc_link(world).join("version").display()
+    );
+    assert!(rc(world) != 0, "a refused uninstall must fail:\n{stdout}");
+    assert!(
+        stdout.lines().any(|l| l == line),
+        "expected `{line}` in the review:\n{stdout}"
+    );
+}
+
+#[then("the link in the home folder is still there")]
+async fn proc_link_intact(world: &mut E2eWorld) {
+    let link = proc_link(world);
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()),
+        "the refused uninstall removed {}:\n{}\n{}",
+        link.display(),
+        output(world),
+        stderr(world)
+    );
+}
+
 #[given("setup.therock_venv points at the user's home folder, which holds their files")]
 async fn venv_is_home(world: &mut E2eWorld) {
     let file = user_file_in_home(world);

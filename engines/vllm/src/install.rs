@@ -1273,6 +1273,34 @@ fi
             contents.contains("ignore-error-codes = [403]"),
             "{contents}"
         );
+        // It created the cache folder, so it marked it as ROCm CLI's own.
+        assert!(
+            paths
+                .cache_dir
+                .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+                .is_file()
+        );
+        Ok(())
+    }
+
+    /// A cache folder that already existed is not claimed as ROCm CLI's own.
+    #[test]
+    fn write_vllm_index_uv_config_leaves_an_existing_cache_folder_unmarked() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        std::fs::create_dir_all(&paths.cache_dir)?;
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+        write_vllm_index_uv_config(&paths, build)?;
+        assert!(
+            !paths
+                .cache_dir
+                .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+                .exists()
+        );
         Ok(())
     }
     /// The prefix boundary (`-device-gfx`, not a bare `starts_with` of

@@ -273,3 +273,18 @@ Feature: Uninstall
     Then the refusal names setup.therock_venv and advises --keep-data, not a variable the user never set
     And the user's files in the home folder are still there
     And the config folder is still there
+
+  # A setting that names a file rather than a folder is judged by where its
+  # folder really is: a file spelled inside home but reached through a link to
+  # a system location is refused, and nothing is removed. The link points at
+  # `/proc`, where nothing can be unlinked even by root, so a regression could
+  # not damage the runner.
+  # Linux-only: it needs `/proc`.
+  @id:uninstall-file-through-linked-folder-refused @requires-os:linux
+  Scenario: uninstall-22 - A data setting naming a file reached through a link to a system folder is refused
+    Given the data folder setting names a file through a link in the home folder to /proc
+    When the user uninstalls
+    Then the refusal says that file really is in a protected system location
+    And the refusal says nothing was removed
+    And the config folder is still there
+    And the link in the home folder is still there
