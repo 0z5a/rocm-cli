@@ -1620,6 +1620,10 @@ jobs:
         for (per_pr_job, nightly_job) in [
             ("e2e-wsl", "e2e-wsl-nightly"),
             ("e2e-gpu-strix-windows", "e2e-gpu-nightly-strix-windows"),
+            // Off the PR path since the two-node PR scope, so the nightly is where
+            // this lane runs on a schedule: it must not drift back to the
+            // offline static `native` host.
+            ("e2e-gpu-strix-ubuntu", "e2e-gpu-nightly-strix"),
         ] {
             let per_pr = runs_on_values(job_block(&sh, per_pr_job));
             let nightly_values = runs_on_values(job_block(&nightly, nightly_job));
@@ -7555,18 +7559,32 @@ jobs:
         // did, while a prefix check still passed. A new job has no entry here
         // and fails until it is added, which is the point: someone must decide
         // how it behaves on `closed`.
-        let lane_if = |extra: &str, platform: &str| {
+        // `extra` gates the whole lane; `inner` sits in the non-dispatch branch,
+        // where a lane that skips `pull_request` keeps the exclusion (see
+        // `mi300x_lane_is_skipped_in_the_merge_queue`).
+        let lane_if = |extra: &str, inner: &str, platform: &str| {
             format!(
                 "always() && needs.changes.result == 'success' && {extra}\
-                 ( (github.event_name != 'workflow_dispatch' \
-                 && needs.changes.outputs.serve == 'true') \
+                 ( (github.event_name != 'workflow_dispatch' && {inner}\
+                 needs.changes.outputs.serve == 'true') \
                  || (github.event_name == 'workflow_dispatch' \
                  && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
             )
         };
         let lane = |job, extra: &str, platform: &str| PinnedIf {
             job,
-            condition: lane_if(extra, platform),
+            condition: lane_if(extra, "", platform),
+            matrix_lane: true,
+        };
+        // Strix Ubuntu and W7900 are off `pull_request` and `merge_group`.
+        let off_pr_lane = |job, platform: &str| PinnedIf {
+            job,
+            condition: lane_if(
+                "",
+                "github.event_name != 'pull_request' \
+                 && github.event_name != 'merge_group' && ",
+                platform,
+            ),
             matrix_lane: true,
         };
         let expected = vec![
@@ -7575,10 +7593,10 @@ jobs:
                 "github.event_name != 'merge_group' && ",
                 "app-dev-gpu",
             ),
-            lane("e2e-gpu-strix-ubuntu", "", "strix-ubuntu"),
+            off_pr_lane("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
             lane("e2e-gpu-strix-windows", "", "strix-windows"),
             lane("e2e-wsl", "", "strix-wsl"),
-            lane("e2e-gpu-w7900", "", "w7900"),
+            off_pr_lane("e2e-gpu-w7900", "w7900"),
             // Skips because the `serve` output of a skipped `changes` is empty.
             PinnedIf {
                 job: "e2e-report",
@@ -7679,18 +7697,104 @@ jobs:
             !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
             "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
         );
-        for job in [
-            "e2e-gpu-strix-ubuntu",
-            "e2e-gpu-strix-windows",
-            "e2e-wsl",
-            "e2e-gpu-w7900",
-        ] {
+        for job in ["e2e-gpu-strix-windows", "e2e-wsl"] {
             // Only the dispatch split may look at the event: any other event
             // condition could silently keep the lane out of the merge queue.
             let gate = normalized_whitespace(&gate(job));
             assert!(
                 !gate.contains("merge_group") && !gate.contains("'pull_request'"),
                 "`{job}` must keep running in the merge queue (gate: `{gate}`)"
+            );
+            // And it must opt into the heavy serves there, for merge_group only,
+            // so the docs' "Windows Strix Halo and WSL2 run the merge-queue
+            // serves" stays true of the workflow.
+            assert_eq!(
+                job_mapping(job_block(&sh, job), "env")
+                    .get("E2E_MERGE_QUEUE")
+                    .map(String::as_str),
+                Some("${{ github.event_name == 'merge_group' && '1' || '' }}"),
+                "`{job}` must set E2E_MERGE_QUEUE for merge_group events only"
+            );
+        }
+        // A pull request runs one Linux node (MI300X) and one Windows pool (the
+        // Strix Halo pool). Strix Ubuntu and W7900 are off pull_request AND
+        // merge_group (W7900 is one runner on borrowed quota; 35% of Strix
+        // Ubuntu's merge-queue jobs hit the 45 min cap; neither check is required
+        // and the queue does not wait for it) but still run on push and dispatch.
+        // Pin the WHOLE gate, not a substring: the event exclusions must sit in the
+        // non-dispatch branch (so a dispatch can still select the lane) and nothing
+        // else about the event may be named, so a gate that dropped push some other
+        // way fails too.
+        for (job, platform) in [
+            ("e2e-gpu-strix-ubuntu", "strix-ubuntu"),
+            ("e2e-gpu-w7900", "w7900"),
+        ] {
+            let expected = format!(
+                "always() && needs.changes.result == 'success' && ( \
+                 (github.event_name != 'workflow_dispatch' \
+                 && github.event_name != 'pull_request' \
+                 && github.event_name != 'merge_group' \
+                 && needs.changes.outputs.serve == 'true') \
+                 || (github.event_name == 'workflow_dispatch' \
+                 && (inputs.platform == 'all' || inputs.platform == '{platform}')) )"
+            );
+            assert_eq!(
+                normalized_whitespace(&gate(job)),
+                normalized_whitespace(&expected),
+                "`{job}` has the wrong event gate (pull_request and merge_group excluded in \
+                 the non-dispatch branch only)"
+            );
+            assert!(
+                !job_block(&sh, job).contains("E2E_MERGE_QUEUE"),
+                "{job} never runs in the merge queue, so it must not opt into @merge-queue scenarios"
+            );
+        }
+    }
+
+    /// The nightly Strix Ubuntu lane moved from a static host (HOME, CARGO_HOME,
+    /// RUSTUP_HOME, TMPDIR and PIP_CACHE_DIR pointed at `/home/ubuntu/actions-runner`)
+    /// to the DevLab Dispatch pool. A pool host has none of those paths, so the job
+    /// must not name the static tree, must not read one of those four variables it
+    /// does not set (an unset variable is empty, not defaulted), and may read
+    /// `$HOME` only for the Rust bootstrap under `$HOME/.cargo/bin`. This is a
+    /// textual guard over the job's non-comment lines, not proof the job runs.
+    #[test]
+    fn nightly_strix_ubuntu_job_holds_no_static_host_paths() {
+        let nightly = read_workflow("nightly.yml");
+        let block = job_block(&nightly, "e2e-gpu-nightly-strix");
+        let env = job_mapping(block, "env");
+        let uncommented: String = block
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !uncommented.contains("actions-runner"),
+            "the pool host has no /home/ubuntu/actions-runner tree"
+        );
+        // Whole-word match, so a future `HF_TMPDIR` is not read as `TMPDIR`.
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        for var in ["CARGO_HOME", "RUSTUP_HOME", "TMPDIR", "PIP_CACHE_DIR"] {
+            let read = uncommented.match_indices(var).any(|(index, _)| {
+                let before = uncommented[..index].chars().next_back();
+                let after = uncommented[index + var.len()..].chars().next();
+                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            });
+            assert!(
+                env.contains_key(var) || !read,
+                "e2e-gpu-nightly-strix reads {var} but no longer sets it"
+            );
+        }
+        for (index, _) in uncommented
+            .match_indices("$HOME")
+            .chain(uncommented.match_indices("${HOME"))
+        {
+            let rest = &uncommented[index..];
+            assert!(
+                rest.starts_with("$HOME/.cargo/bin"),
+                "e2e-gpu-nightly-strix reads $HOME outside the Rust bootstrap, which a pool \
+                 host does not provision: `{}`",
+                rest.lines().next().unwrap_or_default().trim()
             );
         }
     }
@@ -9573,28 +9677,54 @@ permissions:
         );
     }
 
-    /// The job's time limit, the lanes' wait limit and what the doc and the
-    /// workflow comment say of them move together: the limit must leave the
-    /// 30 minutes finishing and publishing a run can take after the longest wait.
+    /// The job's time limit, the lanes' wait and run limits and what the doc and
+    /// the workflow comment say of them move together: a lane may wait its whole
+    /// wait limit and then run its whole run limit, and the job's limit must
+    /// leave the 30 minutes finishing and publishing a run can take after both.
     #[test]
-    fn the_queue_run_timeout_covers_the_wait_limit_the_doc_gives() {
+    fn the_queue_run_timeout_covers_the_wait_and_run_limits_the_doc_gives() {
         let doc = docs_nightly_on_the_queue();
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
-        // The limit as the run inputs give it: "at most N seconds".
+        // The wait limit as the run inputs give it: the bullet "- the wait — ...
+        // at most N seconds", anchored on the bullet's own opening like the run
+        // limit below, so no earlier "at most N" in the doc can be picked up.
         let wait_secs: u64 = flat
-            .split("at most ")
-            .find_map(|rest| rest.split(" seconds").next()?.parse().ok())
-            .expect("the doc's run inputs give the wait limit as `at most N seconds`");
+            .split("- the wait — ")
+            .nth(1)
+            .and_then(|rest| rest.split("at most ").nth(1))
+            .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect("the doc's run inputs give the wait limit as a bullet `- the wait — ... at most N seconds`");
         assert!(
             flat.contains(&format!("({wait_secs} s")),
             "the doc's start section must give the same wait limit"
         );
         let wait_text = format!("{} h {} min", wait_secs / 3600, wait_secs % 3600 / 60);
         assert!(flat.contains(&wait_text), "the doc must say {wait_text}");
+        // The run limit as the run inputs give it: the bullet "- the run time — ...
+        // at most N seconds". Anchored on the bullet's own opening, so that the
+        // phrase "the run time" appearing earlier in the doc cannot be picked up.
+        let run_secs: u64 = flat
+            .split("- the run time — ")
+            .nth(1)
+            .and_then(|rest| rest.split("at most ").nth(1))
+            .and_then(|rest| rest.split(" seconds").next()?.parse().ok())
+            .expect(
+                "the doc's run inputs give the run limit as a bullet `- the run time — ... at most N seconds`",
+            );
+        assert!(
+            flat.contains(&format!("({run_secs} s")),
+            "the doc's start section must give the same run limit"
+        );
+        let run_text = format!("{} h", run_secs / 3600);
+        assert_eq!(run_secs % 3600, 0, "the run limit is whole hours");
         let text = read_workflow("queue-run.yml");
         assert!(
             text.contains(&format!("{wait_secs} s ({wait_text})")),
             "queue-run.yml's comment must give the wait as {wait_secs} s ({wait_text})"
+        );
+        assert!(
+            text.contains(&format!("{run_text} counted from its start")),
+            "queue-run.yml's comment must give the run limit as {run_text}"
         );
         let timeout_minutes: u64 = text
             .lines()
@@ -9604,8 +9734,12 @@ permissions:
             .parse()
             .expect("timeout-minutes is a number");
         assert!(
-            timeout_minutes * 60 >= wait_secs + 30 * 60,
-            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait"
+            timeout_minutes * 60 >= wait_secs + run_secs + 30 * 60,
+            "timeout-minutes: {timeout_minutes} leaves less than 30 minutes after a {wait_secs} s wait and a {run_secs} s run"
+        );
+        assert!(
+            text.contains(&format!(": {timeout_minutes} min.")),
+            "queue-run.yml's comment must give the timeout as {timeout_minutes} min"
         );
     }
 
@@ -9653,9 +9787,14 @@ permissions:
         apt_install_failures: u32,
         curl_failures: u32,
         /// How often `cargo --version` (the toolchain download) and
-        /// `cargo fetch --locked` fail first, each with status 7.
+        /// `cargo fetch --locked --target <host>` fail first, each with
+        /// status 7.
         version_failures: u32,
         fetch_failures: u32,
+        /// Whether `cargo -vV` prints a `host:` line.
+        host_line: bool,
+        /// A `CARGO_BUILD_TARGET` in the lane's environment, if any.
+        build_target: Option<&'static str>,
         suite_rc: i32,
         nightly_rc: Option<i32>,
         channels: Option<&'static str>,
@@ -9678,6 +9817,8 @@ permissions:
                 curl_failures: 0,
                 version_failures: 0,
                 fetch_failures: 0,
+                host_line: true,
+                build_target: None,
                 suite_rc: 0,
                 nightly_rc: None,
                 channels: None,
@@ -9819,13 +9960,20 @@ permissions:
             ),
         )
         .expect("stub sha256sum");
+        let host_triple = format!("{}-unknown-linux-gnu", case.machine);
+        let host_reply = if case.host_line {
+            format!("echo \"host: {host_triple}\"")
+        } else {
+            "echo \"release: 1.96.0\"".to_owned()
+        };
         write_fake_executable(
             &cargo_bin.join("cargo"),
             format!(
                 "#!/bin/bash\necho \"cargo $*\"\n\
                  case \"$*\" in\n\
                  \"--version\") {version};;\n\
-                 \"fetch --locked\") {fetch};;\n\
+                 \"-vV\") {host};;\n\
+                 \"fetch --locked --target {triple}\") {fetch};;\n\
                  \"xtask e2e-prewarm\"*) echo \"prewarm HF_HOME=$HF_HOME UV_CACHE_DIR=$UV_CACHE_DIR\";;\n\
                  \"xtask e2e\")\n\
                  echo \"suite E2E_INCLUDE_NIGHTLY=${{E2E_INCLUDE_NIGHTLY-unset}} \
@@ -9843,6 +9991,8 @@ permissions:
                 // own status.
                 version = fail_first("cargo-version", case.version_failures, 7).replace('\n', "; "),
                 fetch = fail_first("cargo-fetch", case.fetch_failures, 7).replace('\n', "; "),
+                triple = host_triple,
+                host = host_reply,
                 rc = case.suite_rc,
                 nightly = case.nightly_rc.unwrap_or(case.suite_rc)
             ),
@@ -9858,6 +10008,9 @@ permissions:
             .env("E2E_LANE_WORK", dir.path().join("work"));
         if let Some(channels) = case.channels {
             lane.env("E2E_CHANNELS", channels);
+        }
+        if let Some(target) = case.build_target {
+            lane.env("CARGO_BUILD_TARGET", target);
         }
         let output = lane.output().expect("running the lane script");
         let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -9906,7 +10059,8 @@ permissions:
                 "preflight ran\n".to_owned(),
                 // The toolchain and the crates, fetched before the build.
                 "cargo --version\n".to_owned(),
-                "cargo fetch --locked\n".to_owned(),
+                // `cargo -vV` answers the host triple to the script, so it is not logged.
+                "cargo fetch --locked --target x86_64-unknown-linux-gnu\n".to_owned(),
                 "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks\n"
                     .to_owned(),
             ];
@@ -10298,7 +10452,10 @@ permissions:
     fn a_lane_rides_out_a_failed_toolchain_or_crate_fetch_and_never_builds_without_one() {
         for (fetch, command) in [
             ("version", "cargo --version"),
-            ("fetch", "cargo fetch --locked"),
+            (
+                "fetch",
+                "cargo fetch --locked --target x86_64-unknown-linux-gnu",
+            ),
         ] {
             let case = |failures| LaneCase {
                 version_failures: if fetch == "version" { failures } else { 0 },
@@ -10325,5 +10482,60 @@ permissions:
             assert!(!log.contains("cargo build"), "{log}");
             assert!(!out.exists());
         }
+    }
+
+    /// A cargo that reports no host triple stops the lane before any fetch or
+    /// build, rather than passing an empty `--target`.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_stops_when_cargo_reports_no_host_triple() {
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            host_line: false,
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(
+            log.contains("cargo did not report its host triple"),
+            "{log}"
+        );
+        assert!(!log.contains("cargo fetch"), "{log}");
+        assert!(!log.contains("cargo build"), "{log}");
+        assert!(!out.exists());
+    }
+
+    /// The fetch covers only the host's crates, so a build target set from
+    /// outside is refused up front, and a non-x86_64 host's triple is the one
+    /// the fetch is scoped to.
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_refuses_a_build_target_and_scopes_the_fetch_to_the_reported_host() {
+        let LaneRun {
+            rc,
+            log,
+            out,
+            dir: _dir,
+        } = run_lane(&LaneCase {
+            build_target: Some("aarch64-apple-darwin"),
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 1, "{log}");
+        assert!(log.contains("CARGO_BUILD_TARGET is set"), "{log}");
+        assert!(!log.contains("cargo fetch"), "{log}");
+        assert!(!out.exists());
+
+        let LaneRun { rc, log, .. } = run_lane(&LaneCase {
+            machine: "aarch64",
+            ..LaneCase::default()
+        });
+        assert_eq!(rc, 0, "{log}");
+        assert!(
+            log.contains("cargo fetch --locked --target aarch64-unknown-linux-gnu\n"),
+            "{log}"
+        );
     }
 }
