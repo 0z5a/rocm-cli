@@ -181,13 +181,18 @@ impl RefusedRoot {
                  config.json or runtime registry inside it is not taken as proof that it is \
                  ROCm CLI's.",
             ),
-            rocm_core::ProtectedLocation::SharedTopLevel
+            // No marker or setting makes these removable, so the claim holds.
+            rocm_core::ProtectedLocation::FilesystemRoot
+            | rocm_core::ProtectedLocation::Home
+            | rocm_core::ProtectedLocation::ContainsHome
+            | rocm_core::ProtectedLocation::SharedTopLevel
             | rocm_core::ProtectedLocation::OtherUsersHome
             | rocm_core::ProtectedLocation::System => sentence.push_str(
                 " ROCm CLI never removes this folder itself; if you are sure what in it is \
                  ROCm CLI's, remove those files by hand.",
             ),
-            _ => {}
+            // Removable once it resolves, so "never" would be false.
+            rocm_core::ProtectedLocation::Unresolvable => {}
         }
         sentence
     }
@@ -259,9 +264,11 @@ impl UninstallPlan {
             .map(|root| format!("the {} folder {}", root.kind, root.describe()))
             .collect::<Vec<_>>()
             .join("; ");
+        // No blanket "never removes" here: an unmarked folder becomes
+        // removable once it carries the marker, which its advice says. The
+        // advice adds that sentence only for the kinds it is true of.
         Some(format!(
-            "uninstall refused, nothing was removed: {reasons}, and ROCm CLI never removes \
-             such a folder. {advice}"
+            "uninstall refused, nothing was removed: {reasons}. {advice}"
         ))
     }
 }
@@ -1336,6 +1343,11 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("--keep-data"), "{error}");
+        // True of `/`: the plan above holds no entry for it, whatever is set.
+        assert!(
+            error.contains("ROCm CLI never removes this folder itself"),
+            "{error}"
+        );
         let rendered = super::render_uninstall_plan(
             &plan,
             &super::UninstallOptions {
@@ -1742,6 +1754,53 @@ mod tests {
         }
     }
 
+    /// A refusal says ROCm CLI never removes the folder only where no marker,
+    /// setting or later run can make it removable: `NotMarked` clears once the
+    /// marker exists (`creating_the_advised_marker_clears_the_refusal`), and
+    /// `Unresolvable` once the folder resolves. `never` is an exhaustive
+    /// match, so a new kind fails to compile here until it is decided.
+    #[test]
+    fn only_a_refusal_nothing_can_clear_says_never_removes() {
+        use rocm_core::ProtectedLocation as Why;
+        const fn never(why: Why) -> bool {
+            match why {
+                Why::FilesystemRoot
+                | Why::Home
+                | Why::ContainsHome
+                | Why::System
+                | Why::OtherUsersHome
+                | Why::SharedTopLevel => true,
+                Why::NotMarked | Why::Unresolvable => false,
+            }
+        }
+        for why in [
+            Why::FilesystemRoot,
+            Why::Home,
+            Why::ContainsHome,
+            Why::System,
+            Why::OtherUsersHome,
+            Why::SharedTopLevel,
+            Why::NotMarked,
+            Why::Unresolvable,
+        ] {
+            let never = never(why);
+            let refused = super::RefusedRoot {
+                kind: "data",
+                path: PathBuf::from("/x"),
+                resolved: None,
+                real: None,
+                why,
+                source: rocm_core::AppPathSource::Default,
+            };
+            let plan = super::UninstallPlan {
+                refused: vec![refused],
+                ..super::UninstallPlan::default()
+            };
+            let error = plan.refusal_error().expect("refused");
+            assert_eq!(error.contains("never removes"), never, "{why:?}: {error}");
+        }
+    }
+
     fn sandbox(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("rocm-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1807,6 +1866,9 @@ mod tests {
             marker.display()
         );
         assert!(error.contains(&advised), "{error}");
+        // The error must not also claim the folder is never removed: the rest
+        // of this test removes it by following the advice.
+        assert!(!error.contains("never removes"), "{error}");
 
         // Follow the advice.
         std::fs::write(&marker, b"").unwrap();

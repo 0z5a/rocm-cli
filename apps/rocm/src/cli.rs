@@ -720,7 +720,7 @@ rocm logs --search error timeout")]
     /// Windows), unless other programs share the install folder.
     #[command(
         after_help = "Never removes /, your home folder or one containing it, another user's home, a \
-system location (/usr, /etc, /lib, /run, ...; Windows, Program Files, ProgramData), or a shared \
+system location (/usr, /etc, /lib, /run, ...; Windows, Program Files, ProgramData, ...), or a shared \
 folder (anything directly under /, /var/lib, /mnt/<drive>, ...). Outside your home folder it \
 removes only a folder holding the .rocm-cli-root file ROCm CLI writes into folders it creates. A \
 refusal stops the whole uninstall and says what clears it. See the README for the full rules.\n\n\
@@ -2522,6 +2522,56 @@ mod tests {
             "{examples}"
         );
         assert!(rows.contains(&"rocm uninstall"), "{examples}");
+    }
+
+    /// Every system folder `rocm uninstall --help` names is one the uninstall
+    /// really refuses as a system location. The list is abbreviated (`...`),
+    /// so README carries the whole of it; rocm-core's
+    /// `readme_names_every_uninstall_system_root` holds README to the code.
+    /// Each platform's names are checked on that platform's lane.
+    #[test]
+    fn uninstall_help_names_only_folders_it_refuses() {
+        let mut command = cli_command();
+        let help = command
+            .find_subcommand_mut("uninstall")
+            .expect("uninstall subcommand")
+            .render_long_help()
+            .to_string()
+            .replace('\n', " ");
+        let list = help
+            .split_once("system location (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map_or_else(
+                || panic!("no system-location list in:\n{help}"),
+                |(list, _)| list,
+            );
+        let names: Vec<&str> = list
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != "...")
+            .collect();
+        assert!(
+            names.contains(&"/usr") && names.contains(&"Windows"),
+            "{list}"
+        );
+        for name in names {
+            let path = if name.starts_with('/') {
+                if !cfg!(unix) {
+                    continue;
+                }
+                std::path::PathBuf::from(name)
+            } else {
+                if !cfg!(windows) {
+                    continue;
+                }
+                std::path::PathBuf::from(format!("{}/{name}", rocm_core::windows_system_drive()))
+            };
+            assert_eq!(
+                rocm_core::uninstall_root_verdict(&path, None, &[]),
+                rocm_core::UninstallRootVerdict::Refused(rocm_core::ProtectedLocation::System),
+                "--help names {name} as a system location"
+            );
+        }
     }
 
     #[test]

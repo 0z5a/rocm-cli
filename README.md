@@ -1863,7 +1863,7 @@ folder as usual. It never removes:
 
 - `/`, your home folder, or a folder that contains it;
 - `/usr`, `/etc`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/sys`, `/proc`, `/dev`,
-  `/run`, `/media`, `/snap`, or anything inside them — on Windows, `Windows`,
+  `/run`, `/media`, `/snap`, `/mnt/wsl`, `/mnt/wslg`, or anything inside them — on Windows, `Windows`,
   `Program Files`, `Program Files (x86)` and `ProgramData` on the system drive,
   and the same folders on a drive WSL mounts at `/mnt/<drive>`;
 - a folder other programs share: anything directly under `/` (`/opt`, `/srv`,

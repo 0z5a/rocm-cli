@@ -192,7 +192,7 @@ Feature: Uninstall
 
   # Linux-only: on Windows `/` names the current drive's root and renders as
   # `\`, so this line would read differently. The Windows drive-root refusal is
-  # covered only by rocm-core's `a_windows_drive_root_is_the_filesystem_root`
+  # covered only by rocm-core's `windows_roots_follow_the_system_drive`
   # unit test, not end to end.
   @id:uninstall-filesystem-root-refused @requires-os:linux
   Scenario: uninstall-16 - A data folder set to the top of the filesystem is refused
@@ -208,6 +208,7 @@ Feature: Uninstall
     When the user uninstalls
     Then the uninstall is refused because the data folder "<home>" is "your home folder"
     And the refusal says nothing was removed
+    And the refusal says ROCm CLI never removes that folder itself
     And the refusal advises re-running with --keep-data
     And the user's files in the home folder are still there
     And the config folder is still there
@@ -242,17 +243,25 @@ Feature: Uninstall
     And the config folder is still there
 
   # A real folder outside the home folder is only removed when ROCm CLI marked
-  # it as its own. The refusal says how to mark it; doing so clears it.
+  # it as its own. The refusal says how to mark it, and does not claim ROCm CLI
+  # never removes it; marking it clears the refusal and a real run removes it.
   # Linux-only: on Windows the scenario root sits inside the runner's own user
   # folder, where a folder outside the scenario home is another user's home.
   @id:uninstall-unmarked-folder-refused-until-marked @requires-os:linux
   Scenario: uninstall-20 - A data folder outside home without ROCm CLI's marker is refused until the advised marker exists
     Given the data folder is a folder outside the home folder without ROCm CLI's marker
+    When the user uninstalls
+    Then the refusal says nothing was removed
+    And the refusal does not say ROCm CLI never removes that folder
+    And the data folder outside the home folder is still there
     When the user previews an uninstall
     Then the refusal advises creating the marker if the folder is ROCm CLI's
     When the user creates the marker the refusal named
     And the user previews an uninstall
     Then the preview plans to remove the data folder
+    When the user uninstalls
+    Then the uninstall succeeds
+    And the data folder outside the home folder is gone
 
   # The dashboard and the assistant run an approved `rocm uninstall` as a
   # child process with the folders pinned. The refusal must still name the

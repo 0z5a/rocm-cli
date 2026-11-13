@@ -428,10 +428,24 @@ fn default_cache(world: &E2eWorld) -> PathBuf {
     home(world).join(".rocm").join("cache")
 }
 
+/// The config folder an install isolated by `ROCM_CLI_CONFIG_DIR` and
+/// `ROCM_CLI_DATA_DIR` alone uses. Inside the scenario's home but not under
+/// `~/.rocm`: on Windows the scenario root is itself under
+/// `C:\\Users\\<runner>`, so a folder outside the scenario home would be
+/// another user's home there, and refused.
+fn isolated_config(world: &E2eWorld) -> PathBuf {
+    home(world).join("rocm-isolated").join("config")
+}
+
+/// The data folder of that isolated install; see [`isolated_config`].
+fn isolated_data(world: &E2eWorld) -> PathBuf {
+    home(world).join("rocm-isolated").join("data")
+}
+
 /// Where the cache folder belongs when only the config and data folders are
-/// set: inside the scenario's data folder, the one `isolate_env` hands the CLI.
+/// set: inside the isolated install's data folder.
 fn data_cache(world: &E2eWorld) -> PathBuf {
-    world.app_paths().data_dir.join("cache")
+    isolated_data(world).join("cache")
 }
 
 /// Run `rocm` with the config and data folders set but no cache folder, as an
@@ -444,11 +458,15 @@ fn run_without_cache_setting(world: &mut E2eWorld, args: &[&str]) {
     let home = home(world);
     std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
     let home = home.display().to_string();
+    let config = isolated_config(world).display().to_string();
+    let data = isolated_data(world).display().to_string();
     let uv = root.join("uv-cache").display().to_string();
     let hf = root.join("hf-home").display().to_string();
     let envs = [
         ("HOME", home.as_str()),
         ("USERPROFILE", home.as_str()),
+        ("ROCM_CLI_CONFIG_DIR", config.as_str()),
+        ("ROCM_CLI_DATA_DIR", data.as_str()),
         ("UV_CACHE_DIR", uv.as_str()),
         ("HF_HOME", hf.as_str()),
     ];
@@ -471,15 +489,7 @@ async fn data_cache_holds_file(world: &mut E2eWorld) {
     let cache = data_cache(world);
     std::fs::create_dir_all(&cache).expect("failed to create the data folder's cache folder");
     std::fs::write(cache.join("cached.bin"), "cached").expect("failed to write cache file");
-    // The harness's config and data folders sit outside the scenario's home,
-    // where `rocm uninstall` removes only a folder ROCm CLI marked as its own.
-    // They stand for an install ROCm CLI created, so they carry its marker,
-    // and so does the cache folder it would have created inside the data one.
-    let paths = world.app_paths();
-    for folder in [paths.config_dir, paths.data_dir, cache] {
-        std::fs::write(folder.join(".rocm-cli-root"), "created by ROCm CLI\n")
-            .expect("failed to mark the folder as ROCm CLI's own");
-    }
+    std::fs::create_dir_all(isolated_config(world)).expect("failed to create the config folder");
 }
 
 #[when("the user asks what ROCm CLI keeps on disk with only the config and data folders set")]
@@ -533,8 +543,9 @@ async fn uninstall_skips_default_cache(world: &mut E2eWorld) {
 #[then("the data folder's own cache folder is gone")]
 async fn data_cache_gone(world: &mut E2eWorld) {
     let cache = data_cache(world);
+    // `symlink_metadata`, not `exists`: a dangling link left behind is not gone.
     assert!(
-        !cache.exists(),
+        std::fs::symlink_metadata(&cache).is_err(),
         "the uninstall left {} behind:
 {}",
         cache.display(),
@@ -555,27 +566,19 @@ async fn default_cache_intact(world: &mut E2eWorld) {
 
 /// Every place the CLI keeps state when only the config and data folders are
 /// set: those two, the cache folder inside the data folder, and the default
-/// `~/.rocm` that a stray write would land in. The harness's own cache folder
-/// is left out because a runner may share it between scenarios.
+/// `~/.rocm` that a stray write would land in.
 fn state_folders(world: &E2eWorld) -> Vec<PathBuf> {
-    let paths = world.app_paths();
     vec![
-        paths.config_dir,
-        paths.data_dir.clone(),
-        paths.data_dir.join("cache"),
+        isolated_config(world),
+        isolated_data(world),
+        data_cache(world),
         home(world).join(".rocm"),
     ]
 }
 
 #[given("ROCm CLI has never created its folders in the user's home")]
 async fn no_folders_yet(world: &mut E2eWorld) {
-    // The harness creates the config, data and cache folders empty before each
-    // scenario; a machine ROCm CLI never touched has none of them.
-    for sub in ["config", "data", "cache"] {
-        let folder = root(world).join(sub);
-        std::fs::remove_dir(&folder)
-            .unwrap_or_else(|e| panic!("failed to remove the empty {}: {e}", folder.display()));
-    }
+    // A machine ROCm CLI never touched has none of the folders it would use.
     for folder in state_folders(world) {
         assert!(
             std::fs::symlink_metadata(&folder).is_err(),
@@ -717,6 +720,33 @@ async fn refusal_says_nothing_removed(world: &mut E2eWorld) {
     assert!(
         stderr(world).contains("uninstall refused, nothing was removed"),
         "stderr:\n{}",
+        stderr(world)
+    );
+}
+
+/// The sentence a refusal adds only where nothing can make the folder
+/// removable (rocm's `RefusedRoot::advice`).
+const NEVER_REMOVES: &str = "ROCm CLI never removes this folder itself";
+
+#[then("the refusal says ROCm CLI never removes that folder itself")]
+async fn refusal_says_never_removes(world: &mut E2eWorld) {
+    // The scenario's later steps hold the claim to the state: the folder and
+    // the files in it are still there after the refusal.
+    assert!(
+        stderr(world).contains(NEVER_REMOVES),
+        "stderr:\n{}",
+        stderr(world)
+    );
+}
+
+#[then("the refusal does not say ROCm CLI never removes that folder")]
+async fn refusal_does_not_say_never_removes(world: &mut E2eWorld) {
+    // The scenario goes on to mark the folder and remove it, which is why the
+    // claim would be false here. Any wording of it, not only today's sentence.
+    assert!(
+        !stderr(world).contains("never removes") && !output(world).contains("never removes"),
+        "an unmarked folder becomes removable once marked:\n{}\n{}",
+        output(world),
         stderr(world)
     );
 }
@@ -937,6 +967,29 @@ async fn preview_plans_data(world: &mut E2eWorld) {
         "expected `{line}` in the review:\n{stdout}"
     );
     assert!(!stdout.contains("Refused"), "{stdout}");
+}
+
+#[then("the data folder outside the home folder is still there")]
+async fn unmarked_data_intact(world: &mut E2eWorld) {
+    let file = unmarked_data(world).join("keep.txt");
+    assert!(
+        file.is_file(),
+        "the refused uninstall deleted {}:\n{}\n{}",
+        file.display(),
+        output(world),
+        stderr(world)
+    );
+}
+
+#[then("the data folder outside the home folder is gone")]
+async fn unmarked_data_gone(world: &mut E2eWorld) {
+    let data = unmarked_data(world);
+    assert!(
+        std::fs::symlink_metadata(&data).is_err(),
+        "the marked data folder {} was not removed:\n{}",
+        data.display(),
+        output(world)
+    );
 }
 
 #[given("setup.therock_venv points at the user's home folder, which holds their files")]

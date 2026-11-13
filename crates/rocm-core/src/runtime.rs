@@ -828,10 +828,15 @@ pub fn runtime_protected_location_for_home(
 }
 
 /// The system locations a runtime folder may not be in. On Windows these are
-/// `rocm uninstall`'s own, on the system drive; on Unix the list differs from
-/// [`uninstall_system_roots`] on purpose: `/opt` and `/var` are refused here
-/// (a runtime prefix there is the system's), while `rocm uninstall` refuses
-/// only their top level and lets a marked folder below them go.
+/// `rocm uninstall`'s own, on the system drive. On Unix the two lists differ
+/// both ways. `/opt`, `/var` and `/root` are refused here (a runtime prefix
+/// there is the system's), while `rocm uninstall` refuses only their top level
+/// and lets a marked folder below them go. And `/lib32`, `/libx32`, `/run`,
+/// `/media`, `/snap`, `/mnt/wsl` and `/mnt/wslg`, which [`uninstall_system_roots`]
+/// refuses, are not refused here, so `rocm runtimes uninstall`, `rocm storage
+/// remove-old-installs` and the assistant's SDK `--prefix` check accept a
+/// folder inside them. Adding them would change what those accept; the two
+/// lists have not been reconciled.
 fn system_roots(platform: RuntimePlatform) -> Vec<PathBuf> {
     if platform.is_windows() {
         return uninstall_system_roots_on(platform, &windows_system_drive());
@@ -2156,6 +2161,51 @@ mod tests {
                 Some(ProtectedLocation::System),
                 "{}",
                 path.display()
+            );
+        }
+    }
+
+    /// README's "It never removes" list names exactly the system roots
+    /// `rocm uninstall` refuses, on both platforms: every root in the list is
+    /// named there, and every system folder named there is refused as one.
+    /// Not `cfg(unix)`: both platforms are parameters, so this runs on every
+    /// lane.
+    #[test]
+    fn readme_names_every_uninstall_system_root() {
+        let readme = include_str!("../../../README.md");
+        let section = readme
+            .split_once("It never removes:")
+            .and_then(|(_, rest)| rest.split_once("Anywhere else outside your home folder"))
+            .map(|(section, _)| section)
+            .expect("README's `rocm uninstall` section lists what it never removes");
+        let bullet = section
+            .split("\n- ")
+            .find(|bullet| bullet.starts_with("`/usr`"))
+            .expect("the system-folder bullet");
+        let named: Vec<&str> = bullet.split('`').skip(1).step_by(2).collect();
+        for (platform, drive) in [
+            (RuntimePlatform::Linux, "C:"),
+            (RuntimePlatform::Windows, "C:"),
+        ] {
+            for root in uninstall_system_roots_on(platform, drive) {
+                let shown = if platform.is_windows() {
+                    root.file_name().unwrap().to_string_lossy().into_owned()
+                } else {
+                    root.display().to_string()
+                };
+                assert!(named.contains(&shown.as_str()), "README omits `{shown}`");
+            }
+        }
+        for name in named.iter().filter(|name| !name.contains('<')) {
+            let (path, platform) = if name.starts_with('/') {
+                ((*name).to_owned(), RuntimePlatform::Linux)
+            } else {
+                (format!("C:/{name}"), RuntimePlatform::Windows)
+            };
+            assert_eq!(
+                uninstall_root_verdict_on(Path::new(&path), None, &[], platform, "C:"),
+                UninstallRootVerdict::Refused(ProtectedLocation::System),
+                "README names `{name}` as a system folder"
             );
         }
     }

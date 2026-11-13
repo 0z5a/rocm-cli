@@ -962,8 +962,8 @@ fn chat_install_prefix_is_system(prefix: &Path) -> bool {
 }
 
 /// Why the local assistant may not install into `prefix`, if it may not: the
-/// same protected-location rule every recursive delete uses, since an install
-/// folder is one a later uninstall or a broken-venv rebuild may remove.
+/// runtime-folder rule `rocm runtimes uninstall` applies to the same folder,
+/// since an install folder is one a later uninstall or venv rebuild may remove.
 pub(crate) fn chat_install_prefix_protection(prefix: &Path) -> Option<&'static str> {
     if prefix.as_os_str().is_empty() {
         return Some("an empty path");
