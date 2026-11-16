@@ -2169,10 +2169,13 @@ mod tests {
     /// `rocm uninstall` refuses, on both platforms: every root in the list is
     /// named there, and every system folder named there is refused as one.
     /// Not `cfg(unix)`: both platforms are parameters, so this runs on every
-    /// lane.
+    /// lane. README is read at run time rather than embedded, so it is not
+    /// compiled into the test binary as data.
     #[test]
     fn readme_names_every_uninstall_system_root() {
-        let readme = include_str!("../../../README.md");
+        let readme =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"))
+                .expect("README.md at the repo root");
         let section = readme
             .split_once("It never removes:")
             .and_then(|(_, rest)| rest.split_once("Anywhere else outside your home folder"))

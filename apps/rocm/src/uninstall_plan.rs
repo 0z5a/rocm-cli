@@ -2198,10 +2198,9 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&real_etc).unwrap();
         std::os::unix::fs::symlink(&real_etc, home.join("venv")).unwrap();
-        let etc_target = real_etc.clone();
         let resolve: &dyn Fn(&Path) -> std::io::Result<PathBuf> = &move |path: &Path| {
             if path == Path::new("/etc") {
-                Ok(etc_target.clone())
+                Ok(real_etc.clone())
             } else {
                 rocm_core::canonicalize_for_compare(path)
             }

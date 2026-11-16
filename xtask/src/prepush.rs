@@ -210,12 +210,13 @@ fn package_args<'a>(packages: Option<impl Iterator<Item = &'a str>>) -> Vec<Stri
 /// - `README.md`, `docs/`, `skills/`: `rocm`'s `advised_commands` test checks
 ///   every `rocm ...` command shown there, `rocm` compiles in the assistant
 ///   skill, and xtask's tests read the pinned release key under `docs/keys` and
-///   other docs.
+///   other docs. `rocm-core`'s `readme_names_every_uninstall_system_root`
+///   holds README's list of folders `rocm uninstall` never removes to the code.
 /// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
 ///   although it lives in the e2e crate.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
-    ("README.md", &["rocm", "xtask"]),
+    ("README.md", &["rocm", "rocm-core", "xtask"]),
     ("docs/", &["rocm", "xtask"]),
     ("skills/", &["rocm", "xtask"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
@@ -926,7 +927,13 @@ mod tests {
             let names = selected_names(&[path]);
             assert!(names.contains("rocm"), "{path}: {names:?}");
             assert!(names.contains("xtask"), "{path}: {names:?}");
-            assert!(!names.contains("rocm-core"), "{path}: {names:?}");
+            // Only README is read from rocm-core (its uninstall system-root
+            // list); docs and skills must not widen the hook to it.
+            assert_eq!(
+                names.contains("rocm-core"),
+                path == "README.md",
+                "{path}: {names:?}"
+            );
         }
     }
 
