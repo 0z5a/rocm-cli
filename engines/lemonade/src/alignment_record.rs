@@ -292,6 +292,10 @@ mod tests {
             "{fresh}"
         );
         assert!(fresh.contains("pinned for ROCm 7.13.0"), "{fresh}");
+        // Pins the advice only. That `--reinstall` removes the record is
+        // `reinstall_removes_the_record_of_a_failed_alignment` in `install.rs`, and
+        // that the alignment then runs is `with_no_record_the_alignment_runs_as_before`
+        // in `backend_alignment.rs`.
         assert!(
             fresh.contains("`rocm engines install lemonade --reinstall`"),
             "{fresh}"

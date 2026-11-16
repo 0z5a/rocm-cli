@@ -548,6 +548,11 @@ async fn assert_pinned_backend_reused(world: &mut E2eWorld) {
     );
 }
 
+/// Pins the advice only; this scenario does not run the `--reinstall` it names.
+/// That `--reinstall` removes the record is
+/// `reinstall_removes_the_record_of_a_failed_alignment` in the engine's
+/// `install.rs`, and that the alignment then runs is
+/// `with_no_record_the_alignment_runs_as_before` in its `backend_alignment.rs`.
 #[then("the user is told the alignment failed and how to try it again")]
 async fn assert_alignment_retry_advice(world: &mut E2eWorld) {
     let output = combined_output(world);

@@ -2632,6 +2632,9 @@ mod tests {
             notice.contains("aligned to ROCm 7.99.0 1 hour ago"),
             "{notice}"
         );
+        // Pins the advice only. That `--reinstall` removes the record is
+        // `reinstall_removes_the_record_of_a_failed_alignment` in `install.rs`, and
+        // that the alignment then runs is `with_no_record_the_alignment_runs_as_before`.
         assert!(
             notice.contains("rocm engines install lemonade --reinstall"),
             "{notice}"

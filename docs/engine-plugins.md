@@ -82,15 +82,15 @@ retries on its own). `rocm engines install lemonade --reinstall` tries it again
 at once, because it deletes and re-extracts the runtime tree, record included. A
 different active ROCm version, a new Lemonade version (which also re-extracts
 the tree), or a record 24 hours old or older (or dated in the future) runs the
-alignment as before, and an alignment that succeeds removes the record. The record is consulted only when an
-install could align: not with the opt-out set, on an unsupported platform, with
-no active ROCm version or an unreadable pin, or when the pin already equals the
-active ROCm version, all of which leave it untouched and say nothing about it.
-Past those checks, a record that cannot be read is removed with a warning,
-before the backend probe decides whether to align; if it cannot be removed
-either, the warning says so and names `rocm engines install lemonade
---reinstall`, which removes it. A record that cannot be written leaves the next
-install to try again, also with a warning. Setting
+alignment as before, and an alignment that succeeds removes the record. The
+record is consulted only when an install could align: not with the opt-out set,
+on an unsupported platform, with no active ROCm version or an unreadable pin, or
+when the pin already equals the active ROCm version, all of which leave it
+untouched and say nothing about it. Past those checks, a record that cannot be
+read is removed with a warning, before the backend probe decides whether to
+align; if it cannot be removed either, the warning says so and names `rocm
+engines install lemonade --reinstall`, which removes it. A record that cannot be
+written leaves the next install to try again, also with a warning. Setting
 `ROCM_CLI_DISABLE_LEMONADE_BACKEND_ALIGNMENT` neither reads nor changes the
 record.
 
