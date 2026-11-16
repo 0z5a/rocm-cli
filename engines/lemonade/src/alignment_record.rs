@@ -37,8 +37,12 @@ pub(crate) struct AlignmentFailure {
     /// the revert put back.
     pub(crate) pinned_rocm_version: String,
     /// The llama.cpp build tag pinned before the attempt (tier 1 tried it).
+    /// Informational, for a person reading the file: the skip decision
+    /// ([`Self::skips_alignment`]) does not read it.
     pub(crate) pinned_llamacpp_tag: Option<String>,
     /// The newest llama.cpp build tag tier 2 looked up, when the lookup worked.
+    /// Informational, for a person reading the file: the skip decision does not
+    /// read it.
     pub(crate) latest_llamacpp_tag: Option<String>,
     /// The Lemonade version whose runtime tree the attempt ran in.
     pub(crate) lemonade_version: String,
@@ -180,13 +184,20 @@ mod tests {
     use super::*;
     use crate::test_support::scratch_dir;
 
-    /// `ALIGNMENT_FAILURE_RECORD` in the black-box e2e steps
-    /// (tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs, used by
-    /// runtime-33) hard-codes this name to find the record on disk; renaming it
-    /// here means changing it there too.
+    /// `ALIGNMENT_FAILURE_RECORD` in the black-box e2e steps (used by
+    /// runtime-33) hard-codes this name to find the record on disk. Read from that
+    /// file, so a rename on either side fails here, on every lane, rather than
+    /// only when the nightly scenario runs. The include is test-only, and no
+    /// workspace crate is packaged for publishing (`publish = false`).
     #[test]
     fn the_record_file_name_matches_the_one_the_e2e_steps_hard_code() {
-        assert_eq!(ALIGNMENT_FAILURE_RECORD, ".rocm-cli-alignment-failed.json");
+        let steps = include_str!("../../../tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs");
+        let definition =
+            format!("const ALIGNMENT_FAILURE_RECORD: &str = \"{ALIGNMENT_FAILURE_RECORD}\";");
+        assert!(
+            steps.contains(&definition),
+            "lemonade_install_steps.rs no longer defines `{definition}`"
+        );
     }
 
     fn record(failed_at_unix_secs: u64) -> AlignmentFailure {

@@ -480,7 +480,8 @@ async fn lemonade_reinstall_failed_alignment(world: &mut E2eWorld) {
 /// The record a failed alignment leaves in the Lemonade runtime tree. The
 /// engine's own name for it, repeated here because this crate is black-box;
 /// `the_record_file_name_matches_the_one_the_e2e_steps_hard_code` in the engine's
-/// `alignment_record.rs` holds the engine constant to this literal.
+/// `alignment_record.rs` reads this definition and fails on every lane if it
+/// stops matching the engine constant, so keep it on one line as written.
 const ALIGNMENT_FAILURE_RECORD: &str = ".rocm-cli-alignment-failed.json";
 
 /// The runtime tree an `engines install` reports as its `env_path:`.

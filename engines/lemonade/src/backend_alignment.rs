@@ -2330,6 +2330,13 @@ mod tests {
             b"pre-existing",
             "the pre-existing backend must be restored, not left deleted"
         );
+        // A failure is recorded only once the pinned backend is back in place; a
+        // record here would tell the next install to reuse a backend that failed
+        // to install.
+        assert!(
+            matches!(read_alignment_failure(&dir), StoredAlignmentFailure::Absent),
+            "no record is written when the revert's install fails"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -2453,8 +2460,11 @@ mod tests {
     // the record's state matrix: no record, a record that applies, one for another
     // target, an expired one, an unreadable one, a record that cannot be written,
     // an alignment that later succeeds, the opt-out, and an install that fails
-    // after the record skipped the alignment. `--reinstall` removing the record is
-    // in `install.rs` (`reinstall_removes_the_record_of_a_failed_alignment`).
+    // after the record skipped the alignment. A revert whose install fails writes
+    // no record: that is asserted in
+    // `align_revert_restores_the_backend_dir_when_the_fallback_install_fails`.
+    // `--reinstall` removing the record is in `install.rs`
+    // (`reinstall_removes_the_record_of_a_failed_alignment`).
 
     const RECORD_TARGET: &str = "7.99.0";
     const RECORD_PIN: &str = "7.13.0";
@@ -2651,6 +2661,81 @@ mod tests {
             "align owns every install on this path"
         );
         assert!(run.notices.is_empty(), "{:?}", run.notices);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable record is handled where any record is read, before the
+    /// backend probe: by the time the probe runs (the alignment can still go
+    /// ahead), the record is already gone and its warning already printed.
+    #[test]
+    fn an_unreadable_record_is_removed_and_reported_before_the_backend_probe_runs() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-corrupt-before-probe");
+        let record_path = dir.join(crate::alignment_record::ALIGNMENT_FAILURE_RECORD);
+        fs::write(&record_path, b"{ torn").unwrap();
+        let mut manifest = test_manifest(dir.clone());
+        let notices = std::cell::RefCell::new(Vec::new());
+        let mut probe_calls = 0;
+        let mut align_calls = 0;
+
+        let result = prepare_llamacpp_backend_for_active_rocm_impl(
+            &mut manifest,
+            false,
+            false,
+            || at(FAILED_AT),
+            |message| notices.borrow_mut().push(message),
+            || Ok(Some(RECORD_TARGET.to_owned())),
+            read_backend_versions_therock_version,
+            |_manifest| {
+                probe_calls += 1;
+                assert!(
+                    !record_path.exists(),
+                    "the probe ran before the unreadable record was removed"
+                );
+                assert_eq!(
+                    notices.borrow().len(),
+                    1,
+                    "the probe ran before the warning was printed"
+                );
+                Ok(Some(ROCM_BACKEND_NAME.to_owned()))
+            },
+            |_manifest, _force_reinstall| panic!("align owns every install on this path"),
+            |_manifest| panic!("a pin that differs from the target never restores"),
+            |_manifest, _path, _target, _pinned, _disabled| {
+                align_calls += 1;
+                Ok(None)
+            },
+        );
+
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(probe_calls, 1);
+        assert_eq!(align_calls, 1);
+        assert!(
+            notices.borrow()[0].starts_with("Warning: removed an unreadable record"),
+            "{:?}",
+            notices.borrow()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The record is checked before the backend probe, which starts `lemond`: an
+    /// install the record skips never pays for that probe.
+    #[test]
+    fn a_record_that_applies_skips_before_the_backend_probe_runs() {
+        let (dir, _) = runtime_dir_with_packaged_pin("record-skips-probe");
+        write_alignment_failure(&dir, &recorded_failure(RECORD_TARGET, FAILED_AT)).unwrap();
+
+        let run = prepare_against_record_with_probe(
+            &dir,
+            false,
+            at(FAILED_AT + HOUR),
+            || Ok(()),
+            || panic!("the record skipped the alignment; the backend probe must not run"),
+        );
+
+        assert_eq!(run.result.unwrap(), None);
+        assert_eq!(run.align_calls, 0);
+        assert_eq!(run.installs, vec![false]);
+        assert_eq!(run.notices.len(), 1, "{:?}", run.notices);
         fs::remove_dir_all(&dir).ok();
     }
 

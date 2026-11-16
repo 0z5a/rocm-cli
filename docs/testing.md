@@ -2419,7 +2419,11 @@ and a pin that already equals the active ROCm version) leaves it as it is and
 says nothing; one that gets past those checks removes it with a warning, whether
 the alignment then runs, the backend probe fails or the probe selects Vulkan;
 and when it cannot be removed, the warning carries the removal's own error and
-names `rocm engines install lemonade --reinstall`. The scenario
+names `rocm engines install lemonade --reinstall`. Both a record that applies
+and an unreadable one are handled before the backend probe starts `lemond`; a
+revert whose install fails writes no record; and
+`the_record_file_name_matches_the_one_the_e2e_steps_hard_code` reads the e2e
+steps' copy of the record's file name, so the two cannot drift. The scenario
 `runtime-lemonade-backend-alignment-failure-remembered` (runtime-33 in
 [runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature))
 runs the two installs for real on the `@nightly @requires-gpu` Lemonade lanes
