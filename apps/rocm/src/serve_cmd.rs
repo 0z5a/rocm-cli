@@ -1138,17 +1138,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         let spinner = std::cell::RefCell::new(cli_progress::Spinner::new(starting.clone()));
         spinner.borrow_mut().tick();
         let mut shown = starting;
-        // Interactive summary follows download / load / health until ready or
-        // a bounded failure. Piped output keeps the historical 45-second
+        // Interactive summary (stdout and stderr both terminals) follows
+        // download / load / health until ready or a bounded failure. Piped
+        // output, or a redirected stderr, keeps the historical 45-second
         // status budget so a serve that never answers does not block CI.
         // `--wait` keeps waiting past either, until the server answers or dies.
-        let policy = if summary_mode {
-            serve_progress::ServeStartupPolicy::interactive()
-        } else {
-            serve_progress::ServeStartupPolicy::status_budget(
-                serve_progress::PIPED_SERVE_STATUS_BUDGET,
-            )
-        };
+        let policy = serve_progress::ServeStartupPolicy::for_background_serve(
+            summary_mode,
+            std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        );
         // The key is shown when the wait begins, since Ctrl-C or a failed wait
         // would otherwise leave a running authenticated server whose key was never
         // printed. It is then not repeated in the summary below.

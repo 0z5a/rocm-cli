@@ -747,7 +747,11 @@ fn failed_launch_service_id(world: &E2eWorld) -> String {
         .split(marker)
         .nth(1)
         .unwrap_or_else(|| panic!("the failure does not name `rocm logs --service`:\n{screen}"));
-    let id = rest.split('`').next().unwrap_or_default().trim_matches('\'');
+    let id = rest
+        .split('`')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('\'');
     assert!(!id.is_empty(), "no service id in the log hint:\n{screen}");
     id.to_owned()
 }

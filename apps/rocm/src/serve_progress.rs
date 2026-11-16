@@ -173,6 +173,22 @@ impl ServeStartupPolicy {
         }
     }
 
+    /// The policy for a background `rocm serve`: follow the startup only when
+    /// the summary goes to a terminal *and* stderr, where the status line and
+    /// any startup failure are written, is one too. With stderr redirected
+    /// (`rocm serve m 2>log`) nothing would be drawn for up to the full
+    /// deadline, so that case keeps the piped status budget.
+    pub(crate) const fn for_background_serve(
+        summary_on_terminal: bool,
+        stderr_is_terminal: bool,
+    ) -> Self {
+        if summary_on_terminal && stderr_is_terminal {
+            Self::interactive()
+        } else {
+            Self::status_budget(PIPED_SERVE_STATUS_BUDGET)
+        }
+    }
+
     /// Piped / captured output. `timeout` is the historical readiness budget.
     pub(crate) const fn status_budget(timeout: Duration) -> Self {
         Self {
@@ -1689,6 +1705,25 @@ mod tests {
             decide(load, SILENT_LOAD * 2, short),
             ServeStartupDecision::Continue(_)
         ));
+    }
+
+    /// Only a terminal on both streams follows the startup; a redirected
+    /// stderr would hide the status line for up to the whole deadline.
+    #[test]
+    fn a_background_serve_follows_the_startup_only_with_both_streams_on_a_terminal() {
+        let interactive = ServeStartupPolicy::interactive();
+        let piped = ServeStartupPolicy::status_budget(PIPED_SERVE_STATUS_BUDGET);
+        assert_eq!(
+            ServeStartupPolicy::for_background_serve(true, true),
+            interactive
+        );
+        for (summary, stderr) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                ServeStartupPolicy::for_background_serve(summary, stderr),
+                piped,
+                "summary on terminal={summary} stderr terminal={stderr}"
+            );
+        }
     }
 
     #[test]

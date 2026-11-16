@@ -249,8 +249,7 @@ const SIMULATE_STARTUP_EXIT_ENV: &str = "ROCM_E2E_SIMULATE_STARTUP_EXIT";
 /// the spawn's immediate-exit check, so the launch is published and the
 /// startup wait (not the spawn) is what sees the process end.
 #[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
-pub(super) const SIMULATED_STARTUP_EXIT_SCRIPT: &str =
-    "echo 'e2e stand-in engine: loading model weights'; sleep 2; \
+pub(super) const SIMULATED_STARTUP_EXIT_SCRIPT: &str = "echo 'e2e stand-in engine: loading model weights'; sleep 2; \
      echo 'e2e stand-in engine: exiting during startup'; exit 1";
 
 /// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a

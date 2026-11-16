@@ -2231,7 +2231,7 @@ restart a live `running` service whose endpoint does not answer, or a live
 `starting` one past the stale-start window, while it is younger than that
 deadline (a pid whose recorded start time does not match is not live); a
 recoverable engine healthcheck is still restarted.
-Piped output keeps the 45-second status budget. Like `--wait`, the
+Piped output, or a redirected stderr (`ServeStartupPolicy::for_background_serve`), keeps the 45-second status budget. Like `--wait`, the
 interactive wait first prints the service id, `rocm logs --service
 <service-id> --follow` and a public bind's key (`announces_wait` in
 [start.rs](../apps/rocm/src/service_launch/start.rs)), since it can fail

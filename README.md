@@ -1270,7 +1270,7 @@ restart a live server for being slow until those 30 minutes pass. Engine log
 lines shown on the status line have credentials (the endpoint key, `--api-key`
 and token values, `hf_` tokens) masked. Once the server lists the model, the wait
 checks whether it can answer with a one-token request, first right away and
-then at growing intervals up to every 15 seconds. Piped output (not a terminal) keeps
+then at growing intervals up to every 15 seconds. Piped output, or a stderr that is not a terminal (`2>log`), keeps
 the 45-second wait and reports the server as it stood then. Control returns
 to your shell with the server still running; manage it later with
 `rocm services` (below).

@@ -571,7 +571,7 @@ Expected result:
 The default command, without `--foreground` or `--verbose`, leaves the server
 in the background. While it starts, the status line follows the engine: a
 download percent, a load line, or a wait for the model to serve. A model that
-is still loading after 45 seconds (the old wait, which piped output still
+is still loading after 45 seconds (the old wait, which piped output or a redirected stderr still
 uses) keeps that line; it is not replaced by a finished "not ready yet"
 summary. The wait fails with a non-zero exit only when the engine fails or
 exits, a download percent stops for 3 minutes, the endpoint has not listed the model with no
