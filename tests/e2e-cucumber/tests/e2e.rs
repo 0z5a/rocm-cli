@@ -182,6 +182,10 @@ pub struct E2eWorld {
     /// environment and so its telemetry socket (dash-55). Torn down in `Drop`
     /// right after `tui`, for the same reasons.
     pub second_tui: Option<e2e::tui_driver::TuiSession>,
+    /// How many dashboard connections to a telemetry daemon the client log
+    /// held when the first of two dashboards was quit (dash-55, dash-57), so a
+    /// later step can tell the surviving one has connected again.
+    pub dash_connections_before_quit: Option<usize>,
     /// Set by the "interactive chat uses an offline assistant" step so the chat
     /// launch step knows to pass `--chat-mock` (deterministic offline agent, no
     /// endpoint detection) instead of driving the real detection/consent path.
@@ -408,6 +412,7 @@ impl Default for E2eWorld {
             command_dir: None,
             tui: None,
             second_tui: None,
+            dash_connections_before_quit: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
             comfyui_baseline_distributions: None,
@@ -819,6 +824,11 @@ impl Drop for E2eWorld {
         #[cfg(unix)]
         if self.isolated_root.is_some() {
             e2e::automations_steps::restore_audit_dir_permissions(&self.app_paths().audit_dir());
+        }
+        // Likewise the telemetry socket's directory (dash-58).
+        #[cfg(unix)]
+        if let Some(root) = &self.isolated_root {
+            e2e::dash_steps::restore_telemetry_socket_dir_permissions(root.path());
         }
         // `isolated_root` is a `TempDir`; its own Drop removes the directory.
     }

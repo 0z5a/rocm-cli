@@ -1006,3 +1006,40 @@ Feature: Interactive dashboard
     Then the dashboard exits successfully
     And the dashboard reports that its telemetry daemon could not use that file
     And that file is left in place
+
+  # A daemon that takes over from one that stopped reads the benchmark results
+  # file from the start and sends a dashboard that connects to it every row
+  # again, so a dashboard that stays open through the hand-off must not add
+  # those rows to the ones it already lists. Same simulated GPU-less host as
+  # dash-37; Unix only, as there is no daemon socket on Windows.
+  @id:dash-handoff-lists-each-benchmark-result-once @requires-os:linux
+  Scenario: dash-57 - A dashboard that stays open through a hand-off lists each benchmark result once
+    Given a machine with no GPU
+    And two benchmark results have been recorded
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the user opens a second dashboard
+    And the user opens the Observe view of the second dashboard
+    Then the second dashboard lists each recorded benchmark result once
+    When the user quits the first dashboard
+    Then the first dashboard exits successfully
+    And the second dashboard is connected to its telemetry daemon again
+    And the second dashboard still lists each recorded benchmark result once
+
+  # A daemon that served and then stopped for good is reported as having
+  # stopped serving, not as unable to start. Its socket's directory becoming
+  # unreadable is one way: the daemon can no longer check that the path is its
+  # own and gives it up, and no client can reach it any more. A directory
+  # permission does not bind root, so `@requires-dir-permissions` skips this
+  # where the suite runs as root. Same simulated GPU-less host as dash-37.
+  @id:dash-reports-telemetry-daemon-that-stopped-serving @requires-os:linux @requires-dir-permissions
+  Scenario: dash-58 - A dashboard whose telemetry daemon stopped serving says so after it closes
+    Given a machine with no GPU
+    When the user opens the dashboard
+    Then the dashboard is connected to its telemetry daemon
+    When the folder holding the dashboard's telemetry socket stops being readable
+    And the dashboard stays open until its telemetry daemon stops serving
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the dashboard reports that its telemetry daemon stopped serving

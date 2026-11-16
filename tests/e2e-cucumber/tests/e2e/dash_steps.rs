@@ -1734,9 +1734,51 @@ async fn second_dashboard_connected(world: &mut E2eWorld) {
     wait_until_connected(second_session(world), "the second dashboard").await;
 }
 
+/// Records how many connections the client log holds first, so the surviving
+/// dashboard's reconnection can be told from the connection it already had.
 #[when("the user quits the first dashboard")]
 async fn quit_first_dashboard(world: &mut E2eWorld) {
+    let log_dir = world.app_paths().client_log_dir();
+    world.dash_connections_before_quit =
+        Some(client_log(&log_dir).matches(CLIENT_CONNECTED).count());
     quit_tui(world, "the first dashboard").await;
+}
+
+/// Everything the dashboards of this scenario wrote to the client log in
+/// `log_dir`. Every `rocm` process of the scenario appends to the same daily
+/// file.
+fn client_log(log_dir: &std::path::Path) -> String {
+    std::fs::read_dir(log_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The line the TUI client logs (with its `rocm_dash_tui::client` target)
+/// once per connection to a telemetry daemon, in
+/// `crates/rocm-dash-tui/src/client.rs`; this crate cannot import it, so the
+/// text is copied. Change them together.
+const CLIENT_CONNECTED: &str = "rocm_dash_tui::client: connected";
+
+/// Wait until the client log in `log_dir` holds at least `count` lines
+/// containing `needle`.
+async fn wait_for_log_lines(log_dir: &std::path::Path, needle: &str, count: usize, what: &str) {
+    let deadline = tokio::time::Instant::now() + default_timeout();
+    loop {
+        let seen = client_log(log_dir).matches(needle).count();
+        if seen >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what}: the client log holds {seen} of the {count} `{needle}` lines expected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Where `rocm dash` puts its telemetry socket under the scenario's
@@ -1810,6 +1852,93 @@ async fn dashboard_reports_unusable_socket(world: &mut E2eWorld) {
     );
 }
 
+// ── A daemon that stopped serving (dash-58) ───────────────────────
+
+/// Undo [`socket_directory_becomes_unreadable`], best effort, from the world's
+/// teardown, so the isolated root can be removed.
+#[cfg(unix)]
+pub(crate) fn restore_telemetry_socket_dir_permissions(root: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root.join("runtime");
+    if dir.is_dir() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// The directory the telemetry socket sits in stops being readable: the
+/// daemon serving it can no longer check its socket, and no client can reach
+/// it. Root ignores directory permissions, hence `@requires-dir-permissions`.
+#[when("the folder holding the dashboard's telemetry socket stops being readable")]
+async fn socket_directory_becomes_unreadable(world: &mut E2eWorld) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = telemetry_socket_path(world)
+            .parent()
+            .expect("the socket path has a parent")
+            .to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+            .unwrap_or_else(|e| panic!("failed to make {} unreadable: {e}", dir.display()));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = world;
+        panic!("dash-58 is Linux only (@requires-os:linux): no telemetry socket here");
+    }
+}
+
+/// A serving daemon gives its path up after five unreadable checks two
+/// seconds apart, and its keeper then logs the failure (`KEEPER_WARNING` in
+/// `apps/rocm/src/dash_daemon.rs`; its fragment "could not serve its socket"
+/// is copied here, as for dash-56).
+#[when("the dashboard stays open until its telemetry daemon stops serving")]
+async fn stay_open_until_daemon_stops_serving(world: &mut E2eWorld) {
+    wait_for_log_lines(
+        &world.app_paths().client_log_dir(),
+        "could not serve its socket",
+        1,
+        "the telemetry daemon did not stop serving",
+    )
+    .await;
+}
+
+#[then("the dashboard shows it is disconnected from its telemetry daemon")]
+async fn dashboard_shows_disconnected(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_wide_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the dashboard: {e}"));
+    tui.wait_for_screen_where(
+        "the disconnected header",
+        |screen| screen.contains("disconnected") && !screen.contains("· rocm daemon"),
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the dashboard does not show it is disconnected: {e}"));
+}
+
+/// Matches the tail of `REPORT_STOPPED_SERVING` (`apps/rocm/src/dash_daemon.rs`)
+/// from "telemetry daemon", copied as for dash-56. What follows it is the
+/// error of the daemon's last attempt, which names the socket path.
+#[then("the dashboard reports that its telemetry daemon stopped serving")]
+async fn dashboard_reports_daemon_stopped_serving(world: &mut E2eWorld) {
+    let path = telemetry_socket_path(world).display().to_string();
+    let screen = session(world).drain_final_screen().await;
+    let squash = |text: &str| -> String { text.split_whitespace().collect() };
+    let shown = squash(&screen);
+    let opening = squash("telemetry daemon stopped serving:");
+    let Some((_, report)) = shown.split_once(&opening) else {
+        panic!("expected the dashboard to say its telemetry daemon stopped serving, got:\n{screen}")
+    };
+    assert!(
+        report.contains(&squash(&path)),
+        "expected the report to name {path}, got:\n{screen}"
+    );
+    assert!(
+        !shown.contains(&squash("telemetry daemon could not start:")),
+        "a daemon that served must not be reported as unable to start:\n{screen}"
+    );
+}
+
 #[then("that file is left in place")]
 async fn file_left_in_place(world: &mut E2eWorld) {
     let path = telemetry_socket_path(world);
@@ -1819,15 +1948,126 @@ async fn file_left_in_place(world: &mut E2eWorld) {
 }
 
 /// The first dashboard ran the daemon, so its exit drops the second one's
-/// connection. The header the second one showed before that still reads
-/// connected, so a check made straight away could pass on that frame; the
-/// pause gives the client time to see the connection close and redraw as
-/// disconnected (it does so at once), after which only a daemon that is
-/// serving again brings the connected header back.
+/// connection, and the header the second one showed before that still reads
+/// connected: a check of the header alone could pass on that stale frame. The
+/// disconnected header in between is no reliable marker either -- it is on
+/// screen for as little as the client's first 250 ms reconnect wait, which
+/// can be over before this step starts. So the step first waits for the
+/// client log to record one more connection than it held when the first
+/// dashboard was quit -- the surviving dashboard connecting to the daemon
+/// that took over, the only daemon left -- and then for the connected header.
 #[then("the second dashboard is connected to its telemetry daemon again")]
 async fn second_dashboard_connected_again(world: &mut E2eWorld) {
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = world
+        .dash_connections_before_quit
+        .expect("the first dashboard was not quit by this scenario");
+    wait_for_log_lines(
+        &world.app_paths().client_log_dir(),
+        CLIENT_CONNECTED,
+        before + 1,
+        "the second dashboard did not connect again",
+    )
+    .await;
     wait_until_connected(second_session(world), "the second dashboard").await;
+}
+
+// ── Benchmark results across a hand-off (dash-57) ─────────────────
+
+/// The cells of the benchmark results dash-57 records: names nothing else on
+/// the dashboard shows.
+const RECORDED_BENCH_CELLS: [&str; 2] = ["handoff-a", "handoff-b"];
+
+/// Writes them to the benchmark CSV the telemetry daemon reads by default,
+/// `bench/results.csv` under the data directory (the file `rocm bench load`
+/// writes).
+#[given("two benchmark results have been recorded")]
+async fn two_benchmark_results_recorded(world: &mut E2eWorld) {
+    let csv = world.app_paths().data_dir.join("bench").join("results.csv");
+    std::fs::create_dir_all(csv.parent().expect("the CSV path has a parent"))
+        .expect("failed to create the bench directory");
+    let rows = RECORDED_BENCH_CELLS
+        .map(|cell| format!("{cell},1,e2e-model\n"))
+        .concat();
+    std::fs::write(&csv, format!("cell,run,model\n{rows}"))
+        .expect("failed to record the benchmark results");
+}
+
+#[when("the user opens the Observe view of the second dashboard")]
+async fn open_observe_view_of_second(world: &mut E2eWorld) {
+    second_session(world)
+        .send_until("4", "● Observe", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the second dashboard did not open Observe: {e}"));
+}
+
+/// The total in the Bench rows table's title, `Bench rows · N total`.
+fn bench_rows_total(screen: &str) -> Option<usize> {
+    let (_, rest) = screen.split_once("Bench rows · ")?;
+    rest.split_once(" total")?.0.trim().parse().ok()
+}
+
+/// How long the list must keep showing exactly the recorded rows once it
+/// has: rows sent twice arrive within milliseconds of the first copy.
+const BENCH_ROWS_SETTLE: Duration = Duration::from_secs(1);
+
+/// Wait until `daemons` telemetry daemons have read the recorded results
+/// (each logs `bench rows broadcast` once when it reads them, in
+/// `crates/rocm-dash-daemon/src/runner.rs`; copied, as above), then until the
+/// second dashboard's Bench table lists exactly those rows, and require it to
+/// keep listing exactly those for [`BENCH_ROWS_SETTLE`].
+async fn assert_second_lists_recorded_rows_once(world: &mut E2eWorld, daemons: usize) {
+    wait_for_log_lines(
+        &world.app_paths().client_log_dir(),
+        "bench rows broadcast",
+        daemons,
+        "the telemetry daemon did not read the recorded benchmark results",
+    )
+    .await;
+    let recorded = RECORDED_BENCH_CELLS.len();
+    let tui = second_session(world);
+    tui.use_tall_size()
+        .unwrap_or_else(|e| panic!("failed to enlarge the second dashboard: {e}"));
+    tui.wait_for_screen_where(
+        "the Bench table lists the recorded results",
+        |screen| {
+            bench_rows_total(screen) == Some(recorded)
+                && RECORDED_BENCH_CELLS
+                    .iter()
+                    .all(|cell| screen.contains(cell))
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the second dashboard does not list the recorded results: {e}"));
+    let settled = tokio::time::Instant::now() + BENCH_ROWS_SETTLE;
+    while tokio::time::Instant::now() < settled {
+        let screen = tui.screen_text();
+        let total = bench_rows_total(&screen);
+        assert!(
+            total.is_none_or(|total| total == recorded),
+            "the second dashboard lists {total:?} benchmark rows, expected each of the \
+             {recorded} recorded once:\n{screen}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let screen = tui.screen_text();
+    assert_eq!(
+        bench_rows_total(&screen),
+        Some(recorded),
+        "the Bench table must end listing the recorded results:\n{screen}"
+    );
+}
+
+#[then("the second dashboard lists each recorded benchmark result once")]
+async fn second_lists_each_result_once(world: &mut E2eWorld) {
+    assert_second_lists_recorded_rows_once(world, 1).await;
+}
+
+/// After the hand-off a second daemon has read the results file from the
+/// start and sent every row again.
+#[then("the second dashboard still lists each recorded benchmark result once")]
+async fn second_still_lists_each_result_once(world: &mut E2eWorld) {
+    assert_second_lists_recorded_rows_once(world, 2).await;
 }
 
 /// Send the plain quit gesture and nothing else — unlike `quit_dashboard`,

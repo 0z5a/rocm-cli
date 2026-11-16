@@ -1359,6 +1359,17 @@ Expected result:
   main screen once it has restored the terminal, and the launcher then
   switches back to its own alternate screen, a separate buffer, so the lines
   are seen when the launcher itself exits.
+- A daemon that served and then stopped is reported after quitting as having
+  *stopped serving* rather than as unable to start. To see it, give a single
+  dashboard a throwaway socket directory of your own rather than your real
+  `$XDG_RUNTIME_DIR`: `d=$(mktemp -d)`, then `XDG_RUNTIME_DIR=$d rocm dash`;
+  from another terminal run `chmod 000 "$d"`, wait about 15 seconds, quit the
+  dashboard, then `chmod 700 "$d"` and `rm -r "$d"` (the socket and its lock
+  stay behind: a daemon removes its socket only while it can still see it is
+  its own). Do not run this as root, which `chmod 000` does not stop. Nothing is
+  reported when, by the time the dashboard closes, another dashboard's daemon
+  serves the socket -- except a keeper that panicked, which is always
+  reported.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

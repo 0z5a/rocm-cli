@@ -294,9 +294,13 @@ over, so the others reconnect and keep their chart history. After that
 hand-off the GPU figures can stay empty for a while (up to about 15 seconds on
 some hosts) while the new daemon detects the GPU again. A dashboard that
 reconnects to the same daemon can show up to about 30 recent chart points
-twice, a known issue. If the daemon cannot start at all, the dashboard says
-why after you quit it, however you opened it (`rocm dash`, interactive
-`rocm chat`, or the bare `rocm` launcher). The dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+twice, a known issue. If the daemon was failing when you quit the dashboard
+(it could not start, or stopped serving and had not recovered), and no other
+dashboard's daemon is serving by then, the dashboard says why after you quit
+it, however you opened it (`rocm dash`, interactive `rocm chat`, or the bare
+`rocm` launcher). A crash of the dashboard's own daemon keeper is reported
+even when another dashboard's daemon is serving. The dashboard presents five
+tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 
 | Tab | What it shows |
 |---|---|

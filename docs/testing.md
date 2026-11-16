@@ -4424,6 +4424,34 @@ path can be in: a live owner (`a_second_daemon_refuses_a_live_socket_instead_of_
 a live daemon from a build without the lock (`an_answering_socket_without_a_lock_holder_is_left_in_place`),
 a lock holder whose socket does not answer (`a_lock_holder_keeps_the_path_even_when_its_socket_looks_stale`),
 a stale socket from a dead daemon (`a_stale_socket_from_a_dead_daemon_is_replaced`),
+the socket-directory policy for every owner and mode (`the_socket_directory_policy`,
+a pure function), a socket directory another user owns, refused before anything
+is created in it and never chmodded
+(`a_socket_directory_another_user_owns_is_refused_before_anything_is_touched`,
+`another_users_writable_socket_directory_is_refused_not_chmodded`,
+`a_symlink_to_another_users_socket_directory_is_refused`) -- these inject a fake
+uid for the daemon through `ServeSeams::our_uid`, since a test cannot make a
+directory another user really owns; real cross-uid ownership is not exercised --
+a missing socket directory created private, and only a writable one of ours
+tightened, before the claim, with no chmod on a second check
+(`creates_missing_parent_at_0700`,
+`only_a_socket_directory_others_may_write_is_tightened`,
+`serving_creates_a_missing_socket_directory_privately`,
+`serving_restricts_a_socket_directory_it_owns`,
+`a_loose_socket_directory_of_ours_is_made_private_before_the_claim`,
+`a_loose_socket_directory_is_tightened_before_the_claim_runs`), a socket
+directory just created judged like an existing one
+(`a_socket_directory_just_created_is_judged_like_an_existing_one`), a sticky
+directory never chmodded (`a_sticky_socket_directory_is_served_as_it_is`,
+`preexisting_root_sticky_parent_is_used_as_it_is`) and reported as shared
+(`a_sticky_socket_directory_is_reported_as_shared`), with the warning printed
+once, by the daemon that claims the path
+(`the_shared_directory_warning_comes_once_from_the_daemon_that_claims_the_path`), a socket
+directory that cannot be inspected or is not a directory
+(`a_socket_directory_that_cannot_be_inspected_is_reported`,
+`a_socket_directory_that_is_not_a_directory_is_refused`), one reached through
+a symlink, judged by its target (`a_symlinked_socket_directory_is_judged_by_its_target`),
+a symlink planted at the lock path (`a_symlink_at_the_lock_path_is_not_followed`),
 a path that is not a socket (`a_path_that_is_not_a_socket_is_never_removed`),
 a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`),
 a bind lost to a daemon without the lock (`a_bind_lost_to_a_listener_without_the_lock_is_reported_in_use`),
@@ -4446,28 +4474,59 @@ a surviving dashboard takes over when the owner leaves, closing one that never
 owned the daemon leaves it alone, a daemon refused its path is retried and
 reported after the dashboard closes (naming the log only when the warning
 reached it), a keeper that panicked is reported (`a_keeper_that_panicked_is_reported`),
+with its message (`a_keeper_panic_is_reported_with_its_message`), as having
+stopped when it had served (`a_keeper_that_panicked_after_serving_is_reported_as_stopped`),
+ahead of a failure recorded before it (`a_keeper_panic_is_reported_over_a_recorded_failure`,
+`a_keeper_panic_after_unlogged_failures_is_not_reported_as_logged`) and even when
+another daemon serves by the time the dashboard closes
+(`a_keeper_panic_is_reported_even_when_another_daemon_serves`),
 a daemon that recovered or found another daemon serving is not reported
-(`a_failure_ends_when_another_daemon_serves_the_socket`), a failed daemon does not
-hold the dashboard up, the retry waits
-(`a_failing_daemon_backs_off_and_finding_an_owner_resets_it`), and a non-unix
-target starts no keeper. All of these are unix only. The dashboard's own side
-of a reconnect, holding each benchmark row once, is
-`benchmark_rows_are_held_once_across_a_reconnect` in
-[app/mod.rs](../crates/rocm-dash-tui/src/app/mod.rs). It calls `on_connected`
-directly; no test drives the event loop's handling of a `Connected` message,
-which is a one-line call to it.
+(`a_failure_ends_when_another_daemon_serves_the_socket`), or finds another
+daemon serving when the dashboard closes
+(`a_failure_is_not_reported_once_another_daemon_serves_the_socket`), a failed
+daemon does not hold the dashboard up, the retry waits
+(`a_failing_daemon_backs_off_and_finding_an_owner_resets_it`), a removed socket
+served again without a failure (`a_removed_socket_is_served_again_without_a_failure`),
+the report's count (`the_report_counts_failed_attempts_from_two`), and a
+non-unix target starts no keeper. The keeper's timing is checked with the
+daemon scripted, on tokio's paused clock: failed runs spaced by the growing
+backoff (`failed_runs_are_spaced_by_the_growing_backoff`), a daemon that keeps
+stopping soon after it starts serving backed off rather than restarted every
+second (`a_daemon_that_keeps_stopping_soon_after_serving_backs_off`), the
+backoff starting over after a run that served long enough
+(`a_run_that_served_long_enough_starts_the_backoff_over`), a daemon that served
+and then stopped reported as having stopped
+(`a_daemon_that_served_and_then_stopped_is_reported_as_stopped`), and a
+replaced socket claimed again one poll later
+(`a_replaced_socket_is_claimed_again_after_one_poll_without_a_failure`). All of
+these are unix only. The dashboard's own side of a reconnect, holding each
+benchmark row once, is `benchmark_rows_are_held_once_across_a_reconnect` in
+[app/mod.rs](../crates/rocm-dash-tui/src/app/mod.rs), which calls
+`on_connected` directly; `dash-57` below covers the event loop's call to it.
 
 End to end, in [dash.feature](../tests/e2e-cucumber/features/dash.feature),
 `dash-55` opens two dashboards in one pseudo-terminal environment, quits the
-first and requires the second to show the connected header again, and
+first and requires the second to connect again -- the client log records
+one more connection than it held when the first was quit -- and then to show
+the connected header; `dash-57` does the same with two benchmark results
+recorded in the benchmark CSV the daemon reads, and requires the second
+dashboard to list exactly those two rows, each once, both before and after the
+hand-off; and
 `dash-56` puts a regular file where the socket goes and requires the dashboard
 to say, after it closes, that it could not use that file and where the
-warning was logged (and the log to hold it), and to leave the file in place. Both carry only `@requires-os:linux`, so they run on every Linux lane,
-GPU or not, and are skipped on Windows; each simulates a GPU-less host itself
-(as `dash-37` does), so the runner's GPU does not change the outcome:
+warning was logged (and the log to hold it), and to leave the file in place;
+`dash-58` makes the socket's directory unreadable under a serving daemon,
+waits until the daemon gives the socket up, requires the dashboard to show it
+is disconnected and, after it closes, to report that its telemetry daemon
+stopped serving (naming the socket), not that it could not start. `dash-55`
+to `dash-57` carry only `@requires-os:linux`, so they run on every Linux lane,
+GPU or not, and are skipped on Windows; `dash-58` also carries
+`@requires-dir-permissions`, since a directory permission does not bind root,
+and is skipped where the suite runs as root. Each simulates a GPU-less host
+itself (as `dash-37` does), so the runner's GPU does not change the outcome:
 
 ```bash
-cargo xtask e2e -- -n "dash-5[56]"
+cargo xtask e2e -- -n "dash-5[5-8]"
 ```
 
 ## Windows Tool Notes

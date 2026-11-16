@@ -62,6 +62,9 @@ const OVERFLOW_COLS: u16 = 90;
 /// dock switches its GPU panel into the wide layout at.
 const WIDE_ROWS: u16 = 45;
 const WIDE_COLS: u16 = 180;
+/// Tall enough that the Observe tab's Bench section, the last of its four
+/// stacked sections, has room for its rows table under the rollup.
+const TALL_ROWS: u16 = 100;
 
 /// The initial geometry as `vt100` wants it (`NonZeroU16`); the constants above
 /// stay `u16` because `PtySize` takes that. A zero here fails the build.
@@ -676,6 +679,12 @@ impl TuiSession {
     /// panel needs to render its wide layout (see `dock::is_wide`).
     pub fn use_wide_size(&mut self) -> Result<(), String> {
         self.resize_to(WIDE_ROWS, WIDE_COLS)
+    }
+
+    /// Enlarge to [`TALL_ROWS`]x[`WIDE_COLS`], so the Observe tab shows the
+    /// Bench section's rows table.
+    pub fn use_tall_size(&mut self) -> Result<(), String> {
+        self.resize_to(TALL_ROWS, WIDE_COLS)
     }
 
     /// Shrink to [`OVERFLOW_ROWS`]x[`OVERFLOW_COLS`] — small enough that the

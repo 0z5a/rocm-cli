@@ -709,6 +709,12 @@ rocm logs --search error timeout")]
     /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
     /// lemonade_port in config.json. External models have no Services stop/restart
     /// controls; discovery is read-only and quitting leaves external servers running.
+    ///
+    /// On Linux, open dashboards share one telemetry daemon; when the dashboard
+    /// running it closes, one still open takes it over. If the daemon was
+    /// failing when the dashboard closed, the reason is printed after it closes,
+    /// unless another dashboard's daemon is serving by then; a crash of the
+    /// dashboard's own daemon keeper is reported even then.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]

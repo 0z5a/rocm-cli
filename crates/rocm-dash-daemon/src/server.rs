@@ -41,8 +41,17 @@ const BENCH_RING_CAP: usize = rocm_dash_core::bench_schema::BENCH_HISTORY_CAP;
 /// Start the daemon on `listen` (e.g. `unix:/run/user/1000/rocmdashd.sock`).
 ///
 /// Access control is enforced by filesystem permissions: the Unix socket is
-/// created with mode `0o600` so only the owning user can connect. The parent
-/// directory is created if it does not exist.
+/// created with mode `0o600` so only the owning user can connect. The socket's
+/// directory is checked before anything is created in it, judged by what it
+/// resolves to when it is a symlink:
+///
+/// * a missing one is created with mode `0o700`;
+/// * something that is not a directory is always refused, first;
+/// * a sticky directory (such as `/tmp`) is never chmodded, whoever owns it,
+///   and is used when root or this user owns it;
+/// * any other directory owned by another user is refused;
+/// * one this user owns is restricted to `0o700` when group or others may
+///   write in it, and otherwise left as it is.
 ///
 /// One daemon owns a socket path at a time (see `SocketClaim`): this returns
 /// [`SocketInUse`] at once, removing or replacing nothing at the socket path,
@@ -76,94 +85,148 @@ pub async fn run_with_ready(
     }
 }
 
-/// A directory we could not tighten to `0o700` is safe to keep using only if no
-/// unprivileged user can tamper with entries inside it. The one such case is a
-/// **root-owned, sticky** directory — the `/tmp` signature (mode `1777`): the
-/// sticky bit means only the owner of an entry (us) may remove or rename it, so
-/// our `0o600` socket cannot be replaced. Any other owner means a local,
-/// unprivileged user controls the path (a squatting attack), which is not safe.
+/// What to do with an existing socket directory, decided from its owner and
+/// mode alone (see [`socket_dir_verdict`]).
 #[cfg(unix)]
-const fn is_safe_shared_dir(uid: u32, mode: u32) -> bool {
-    uid == 0 && (mode & 0o1000 != 0)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketDirVerdict {
+    /// Use it as it is.
+    Use,
+    /// A sticky directory others may write in, such as `/tmp`: use it as it
+    /// is, and say so once the path is claimed.
+    UseShared,
+    /// Ours, but others may write in it: restrict it to `0o700` first.
+    Tighten,
+    /// Another user controls it: refuse it.
+    Refuse,
 }
 
-/// Why a socket directory this daemon could not tighten is refused.
+/// The socket-directory policy, as a pure function of the directory's owner
+/// and mode and this process's effective uid.
 ///
-/// Lifted out of [`prepare_socket_dir`] so the wording itself is reachable from
-/// a test. The branch that emits it needs a directory owned by a *second* uid,
-/// which a unit test cannot conjure -- the same limitation already recorded on
-/// `only_root_owned_sticky_dir_is_safe_shared` -- so without this split the
-/// message has no coverage at all.
+/// * A **sticky** directory is never chmodded, whoever owns it -- root with
+///   its socket directly in `/tmp` included. The sticky bit means only an
+///   entry's owner may remove or rename it, so our `0o600` socket and lock
+///   cannot be replaced there. It is usable when root or this user owns it;
+///   any other owner could remove our entries, so it is refused.
+/// * A directory **we own** is restricted to `0o700` only when group or others
+///   may write in it; a `0o755`, `0o740` or `0o500` one is left as it is.
+/// * Any **other owner** means another local user controls the path (a
+///   squatting attack), so it is refused.
+#[cfg(unix)]
+const fn socket_dir_verdict(dir_uid: u32, mode: u32, our_uid: u32) -> SocketDirVerdict {
+    let writable_by_others = mode & 0o022 != 0;
+    if mode & 0o1000 != 0 {
+        return if dir_uid != 0 && dir_uid != our_uid {
+            SocketDirVerdict::Refuse
+        } else if writable_by_others {
+            SocketDirVerdict::UseShared
+        } else {
+            SocketDirVerdict::Use
+        };
+    }
+    if dir_uid != our_uid {
+        SocketDirVerdict::Refuse
+    } else if writable_by_others {
+        SocketDirVerdict::Tighten
+    } else {
+        SocketDirVerdict::Use
+    }
+}
+
+/// Why a socket directory another user controls is refused. Its own function
+/// so a test can check the wording directly as well as through
+/// [`check_socket_dir`], whose refusal path a test reaches by running the
+/// check as a different uid (see `ServeSeams::our_uid`).
 #[cfg(unix)]
 fn unsecurable_socket_dir_context(parent: &std::path::Path) -> String {
     format!(
-        "restricting socket directory {} to mode 0700 - it is owned by \
-         another user, so a local user could replace the telemetry \
-         socket. Point the socket at a directory you own, for example \
-         under $XDG_RUNTIME_DIR or $HOME",
+        "refusing socket directory {} - it is owned by another user, so a \
+         local user could replace the telemetry socket. Point the socket at a \
+         directory you own, for example under $XDG_RUNTIME_DIR or $HOME",
         parent.display()
     )
 }
 
-/// Ensure the socket's parent directory exists and is private (mode `0o700`).
-///
-/// Directory permissions are *defense-in-depth*: the socket itself is bound with
-/// mode `0o600` (see `run_unix`), so only the owning user can ever connect.
-/// `set_permissions` fails with `EPERM` only when we do not own the directory,
-/// which is exactly what we key the policy on:
-///
-/// * **We own it** (chmod succeeds) — it is now `0o700`; continue.
-/// * **A root-owned sticky directory** such as `/tmp` (chmod fails) — the sticky
-///   bit stops other users removing our socket, so warn and continue. Aborting
-///   here is what previously crashed the embedded telemetry daemon for any user
-///   whose configured socket lived directly under `/tmp`.
-/// * **Any other owner** (chmod fails) — another unprivileged user owns this
-///   path and could unlink or replace the socket, so refuse rather than bind a
-///   telemetry endpoint inside an attacker-controlled directory.
+/// This process's effective user id: who owns what it creates.
 #[cfg(unix)]
-fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::PermissionsExt;
+#[allow(unsafe_code)] // libc FFI
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, cannot fail, and is always safe
+    // to call.
+    unsafe { libc::geteuid() }
+}
 
-    // Skip an empty parent (relative socket target such as `unix:foo.sock`).
-    // Operating on `""` would target the CWD.
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
+/// Make sure the socket's parent directory may be used, before anything is
+/// created, opened, probed or removed in it, and say whether it is a shared
+/// sticky directory (for the warning [`warn_shared_socket_dir`] gives once
+/// the path is claimed).
+///
+/// A missing parent is created at mode `0o700` (it is then ours). An existing
+/// one is judged by what it resolves to, following symlinks -- the directory
+/// the socket and its lock would really be created in. Something that is not
+/// a directory is always refused, first; otherwise [`socket_dir_verdict`]
+/// decides. The only chmod is the one it asks for, on a directory of ours
+/// others may write in, so the claim never works in it while it is open to
+/// them; a directory already acceptable is left untouched, with no chmod and
+/// no warning, since a dashboard that does not own the daemon runs this
+/// several times a second.
+#[cfg(unix)]
+fn check_socket_dir(parent: &std::path::Path, our_uid: u32) -> anyhow::Result<bool> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
-    // `DirBuilder::mode` only applies to directories it creates; a pre-existing
-    // directory keeps its current permissions, which is why we tighten
-    // explicitly below.
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(parent)
-        .with_context(|| format!("creating socket directory {}", parent.display()))?;
-
-    if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-        // chmod only fails because we do not own the directory. Decide from the
-        // directory's *actual* owner and mode — not from whether we think we
-        // just created it, which is racy — whether it is nonetheless safe.
-        let meta = std::fs::metadata(parent).with_context(|| {
-            format!(
-                "inspecting socket directory {} after it could not be secured",
-                parent.display()
-            )
-        })?;
-        if is_safe_shared_dir(meta.uid(), meta.mode()) {
-            warn!(
-                dir = %parent.display(),
-                error = %e,
-                "could not restrict socket directory to mode 0700; continuing because \
-                 it is a root-owned sticky directory (e.g. /tmp) and the socket is \
-                 created with mode 0600"
-            );
-        } else {
-            return Err(e).with_context(|| unsecurable_socket_dir_context(parent));
+    let inspecting = || format!("inspecting socket directory {}", parent.display());
+    let meta = match std::fs::metadata(parent) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| format!("creating socket directory {}", parent.display()))?;
+            // `create` also succeeds when someone else made the directory
+            // between the stat above and here, so judge what is there now
+            // like any existing directory.
+            std::fs::metadata(parent).with_context(inspecting)?
         }
+        Err(e) => {
+            return Err(e).with_context(inspecting);
+        }
+    };
+    if !meta.is_dir() {
+        return Err(anyhow!(
+            "socket directory {} is not a directory; point the socket at a directory you own",
+            parent.display()
+        ));
     }
-    Ok(())
+    match socket_dir_verdict(meta.uid(), meta.mode(), our_uid) {
+        SocketDirVerdict::Use => Ok(false),
+        SocketDirVerdict::UseShared => Ok(true),
+        SocketDirVerdict::Tighten => {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+                || {
+                    format!(
+                        "restricting socket directory {} to mode 0700",
+                        parent.display()
+                    )
+                },
+            )?;
+            Ok(false)
+        }
+        SocketDirVerdict::Refuse => Err(anyhow!(unsecurable_socket_dir_context(parent))),
+    }
+}
+
+/// The warning for a socket directory [`check_socket_dir`] found shared and
+/// sticky, given once the path is claimed rather than on every attempt.
+#[cfg(unix)]
+fn warn_shared_socket_dir(parent: &std::path::Path) {
+    warn!(
+        dir = %parent.display(),
+        "socket directory is a shared sticky directory (e.g. /tmp); leaving its mode as \
+         it is and continuing, because only an entry's owner may remove it there and \
+         the socket is created with mode 0600"
+    );
 }
 
 /// Returned by [`run`] when another telemetry daemon already owns the socket
@@ -304,8 +367,23 @@ async fn probe_socket(path: &std::path::Path) -> Option<std::io::Result<()>> {
     .ok()
 }
 
+/// Whether something answers at `path` right now.
+///
+/// A connection to it is accepted (or the listener is too busy to accept in
+/// time). The same probe a claim uses to tell a live socket from a stale one,
+/// and as careful with the daemon it reaches: it waits for the greeting before
+/// hanging up. `false` when nothing is there, nobody listens, or the path is
+/// not a socket.
+#[cfg(unix)]
+pub async fn socket_answers(path: &std::path::Path) -> bool {
+    matches!(
+        probe_verdict(probe_socket(path).await),
+        ProbeVerdict::Answered
+    )
+}
+
 /// The lock file that says which daemon owns `socket`: the socket path with
-/// `.lock` appended, in the same (private) directory.
+/// `.lock` appended, in the same directory.
 #[cfg(unix)]
 fn socket_lock_path(socket: &std::path::Path) -> PathBuf {
     let mut lock = socket.as_os_str().to_owned();
@@ -381,6 +459,9 @@ impl SocketClaim {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            // A symlink planted at the lock path is refused, not followed to
+            // create or lock a file somewhere else.
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
             .with_context(|| format!("opening socket lock {}", lock_path.display()))?;
         match lock.try_lock() {
@@ -577,6 +658,9 @@ struct ServeSeams {
     client_tasks: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// How often the socket path is checked.
     path_check_interval: std::time::Duration,
+    /// The user the socket directory must belong to (see
+    /// [`check_socket_dir`]).
+    our_uid: u32,
 }
 
 #[cfg(unix)]
@@ -586,6 +670,7 @@ impl ServeSeams {
             start_runner: Box::new(start_run_loop),
             client_tasks: None,
             path_check_interval: PATH_CHECK_INTERVAL,
+            our_uid: effective_uid(),
         }
     }
 }
@@ -594,7 +679,7 @@ impl ServeSeams {
 #[cfg(unix)]
 fn runner_stopped_error(outcome: Result<(), tokio::task::JoinError>) -> anyhow::Error {
     match outcome {
-        Ok(()) => anyhow!("the telemetry runner stopped; restarting the daemon"),
+        Ok(()) => anyhow!("the telemetry runner stopped"),
         Err(e) if e.is_panic() => anyhow!("the telemetry runner panicked: {e}"),
         Err(e) => anyhow!("the telemetry runner was cancelled: {e}"),
     }
@@ -618,18 +703,21 @@ async fn serve_unix(
 ) -> anyhow::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     // The lock file lives in the socket's directory, so that directory has to
-    // exist before the claim. It is tightened (or refused) only after the claim
-    // succeeds: a dashboard that is not the owner retries several times a
-    // second, and must not repeat `prepare_socket_dir`'s chmod -- or its
-    // warning for a shared sticky directory -- on every attempt.
-    if let Some(parent) = parent
-        && !parent.is_dir()
-    {
-        prepare_socket_dir(parent)?;
-    }
+    // exist, be one another user does not control, and not be writable by
+    // others if it is ours, before the claim creates, opens or probes anything
+    // in it. The check changes nothing in a directory that is already
+    // acceptable: a dashboard that is not the owner retries several times a
+    // second. The warning for a shared sticky directory waits until the path
+    // is claimed, so it is given once per daemon rather than per attempt.
+    let shared = match parent {
+        Some(parent) => check_socket_dir(parent, seams.our_uid)?,
+        None => false,
+    };
     let mut claim = SocketClaim::claim(&path).await?;
-    if let Some(parent) = parent {
-        prepare_socket_dir(parent)?;
+    if let Some(parent) = parent
+        && shared
+    {
+        warn_shared_socket_dir(parent);
     }
     // `claim` is dropped when this function returns or the task running it
     // is aborted -- that is, when this daemon stops serving -- and removes the
@@ -869,8 +957,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PAUSE_RESUME_UNSUPPORTED, is_safe_shared_dir, prepare_socket_dir,
-        unsecurable_socket_dir_context,
+        PAUSE_RESUME_UNSUPPORTED, SocketDirVerdict, check_socket_dir, effective_uid,
+        socket_dir_verdict, unsecurable_socket_dir_context,
     };
 
     /// ROCMAI-543: the pause/resume notice is written to the daily-rotated
@@ -912,93 +1000,124 @@ mod tests {
         );
     }
 
-    /// The safe-to-continue predicate is the security-critical decision for a
-    /// directory we cannot tighten, and the squatting case (a non-root user
-    /// owning the parent) cannot be reproduced in a unit test without a second
-    /// uid — so pin every owner/mode combination here.
+    /// The socket-directory policy for every owner/mode combination that
+    /// matters. Directories owned by root or by a second user cannot be made
+    /// in a unit test, so the decision is pinned here as a pure function; the
+    /// serving-level tests below reach the same decision by running the check
+    /// as a different uid (`ServeSeams::our_uid`).
     #[test]
-    fn only_root_owned_sticky_dir_is_safe_shared() {
-        assert!(is_safe_shared_dir(0, 0o1777), "/tmp signature is safe");
-        assert!(is_safe_shared_dir(0, 0o1700), "root-owned + sticky is safe");
-        assert!(
-            !is_safe_shared_dir(0, 0o0777),
-            "root-owned without the sticky bit is not safe: others can unlink our socket"
-        );
-        assert!(
-            !is_safe_shared_dir(1000, 0o1777),
-            "a non-root user owning the parent is a squatting risk, even with sticky set"
-        );
-        assert!(
-            !is_safe_shared_dir(1000, 0o0700),
-            "another unprivileged owner is never safe"
-        );
+    fn the_socket_directory_policy() {
+        use SocketDirVerdict::{Refuse, Tighten, Use, UseShared};
+
+        let cases = [
+            // (owner, mode, our uid, verdict, why)
+            (0, 0o1777, 1000, UseShared, "/tmp, as a user"),
+            (0, 0o1777, 0, UseShared, "/tmp, as root: never chmodded"),
+            (
+                1000,
+                0o1777,
+                1000,
+                UseShared,
+                "our own sticky shared directory",
+            ),
+            (0, 0o1700, 1000, Use, "root-owned, sticky, private"),
+            (
+                1001,
+                0o1777,
+                1000,
+                Refuse,
+                "another user's sticky directory",
+            ),
+            (1000, 0o777, 1000, Tighten, "ours, anyone may write"),
+            (1000, 0o775, 1000, Tighten, "ours, group may write"),
+            (1000, 0o755, 1000, Use, "ours, others may only read"),
+            (1000, 0o740, 1000, Use, "ours, group may only read"),
+            (1000, 0o500, 1000, Use, "ours, read-only"),
+            (1000, 0o700, 1000, Use, "ours, private"),
+            (0, 0o755, 0, Use, "root's own directory, as root"),
+            (1001, 0o700, 1000, Refuse, "another user's directory"),
+            (
+                1001,
+                0o775,
+                1000,
+                Refuse,
+                "another user's writable directory",
+            ),
+            (
+                0,
+                0o777,
+                1000,
+                Refuse,
+                "root-owned, not sticky, anyone may write",
+            ),
+            (0, 0o755, 1000, Refuse, "root-owned, not sticky"),
+        ];
+        for (owner, mode, ours, verdict, why) in cases {
+            assert_eq!(
+                socket_dir_verdict(owner, mode, ours),
+                verdict,
+                "{why}: owner {owner}, mode {mode:o}, we are {ours}"
+            );
+        }
     }
 
-    /// A freshly created nested parent must end up at mode 0700.
+    fn mode_bits(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// A missing nested parent is created, at mode 0700.
     #[test]
     fn creates_missing_parent_at_0700() {
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("nested").join("telemetry");
-        prepare_socket_dir(&parent).expect("should create and secure a new directory");
-        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "newly created socket dir must be private");
+        check_socket_dir(&parent, effective_uid()).expect("should create a new directory");
+        assert_eq!(
+            mode_bits(&parent),
+            0o700,
+            "newly created socket dir must be private"
+        );
     }
 
-    /// A pre-existing parent we own but with looser perms gets tightened to 0700.
+    /// A directory of ours others may write in is restricted to 0700; one they
+    /// may only read, or not even that, is left exactly as it is.
     #[test]
-    fn tightens_owned_preexisting_parent() {
+    fn only_a_socket_directory_others_may_write_is_tightened() {
         let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("loose");
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        prepare_socket_dir(&parent).expect("should tighten a directory we own");
-        let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        for (mode, after) in [
+            (0o777, 0o700),
+            (0o775, 0o700),
+            (0o755, 0o755),
+            (0o500, 0o500),
+        ] {
+            let parent = tmp.path().join(format!("dir-{mode:o}"));
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            check_socket_dir(&parent, effective_uid()).expect("our own directory is usable");
+            assert_eq!(mode_bits(&parent), after, "a {mode:o} directory of ours");
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
-    /// An empty parent (relative socket target like `unix:foo.sock`) is a no-op.
+    /// The real `/tmp`, when it is the root-owned sticky kind and not ours: it
+    /// is used as it is (and reported as shared, for the warning), never
+    /// chmodded. Skipped where the temp dir is something else (a custom
+    /// `TMPDIR`, some containers) or is our own.
     #[test]
-    fn empty_parent_is_noop() {
-        prepare_socket_dir(Path::new("")).expect("empty parent must be skipped");
-    }
-
-    /// Regression: a socket parented at a root-owned sticky directory (`/tmp`,
-    /// mode 1777) must NOT abort the daemon — the chmod EPERM is downgraded to a
-    /// warning because the sticky bit + 0600 socket protect the endpoint. Before
-    /// the fix this returned an error and crashed the embedded telemetry daemon.
-    ///
-    /// This exercises the real fix on Linux CI (where `temp_dir()` is `/tmp`,
-    /// root-owned, and the test runs unprivileged). It is skipped when we own the
-    /// temp dir or it is not a root-owned sticky dir (e.g. a custom `TMPDIR`, some
-    /// containers, or macOS) — there chmod would either succeed and mutate a
-    /// shared directory, or the safe-shared predicate would legitimately refuse,
-    /// neither of which is this regression. `is_safe_shared_dir` is unit-tested
-    /// separately for the refuse path.
-    #[test]
-    fn preexisting_root_sticky_parent_does_not_abort() {
+    fn preexisting_root_sticky_parent_is_used_as_it_is() {
         let tmpdir = std::env::temp_dir();
         let Ok(meta) = std::fs::metadata(&tmpdir) else {
             eprintln!("skip: no temp dir to probe; nothing to assert");
             return;
         };
-        if !is_safe_shared_dir(meta.uid(), meta.mode()) {
-            eprintln!("skip: temp dir is not the root-owned-sticky /tmp signature");
+        if meta.uid() != 0 || meta.mode() & 0o1000 == 0 || effective_uid() == 0 {
+            eprintln!("skip: temp dir is not a root-owned sticky directory of someone else's");
             return;
         }
-        // Determine our effective uid by stat-ing a file we create ourselves.
-        let probe = tmpdir.join(format!("rocmdashd-uidprobe-{}", std::process::id()));
-        if std::fs::write(&probe, b"x").is_err() {
-            eprintln!("skip: cannot write a probe file; cannot determine our uid");
-            return;
-        }
-        let my_uid = std::fs::metadata(&probe).map(|m| m.uid()).ok();
-        let _ = std::fs::remove_file(&probe);
-        // Only meaningful when we do not own the dir, so chmod is guaranteed to
-        // EPERM and the warn-and-continue path is actually taken.
-        if my_uid != Some(meta.uid()) {
-            prepare_socket_dir(&tmpdir)
-                .expect("must not abort on a root-owned sticky parent it cannot chmod (e.g. /tmp)");
-        }
+        let before = mode_bits(&tmpdir);
+        let shared = check_socket_dir(&tmpdir, effective_uid())
+            .expect("must not refuse a root-owned sticky parent (e.g. /tmp)");
+        assert!(shared, "/tmp is reported as shared, for the warning");
+        assert_eq!(mode_bits(&tmpdir), before, "/tmp is never chmodded");
     }
 
     // ── Socket ownership (ROCMAI-456) ─────────────────────────────────
@@ -1554,6 +1673,7 @@ mod tests {
                 start_runner,
                 client_tasks: None,
                 path_check_interval: super::PATH_CHECK_INTERVAL,
+                our_uid: super::effective_uid(),
             };
             let outcome = tokio::time::timeout(DEADLINE, start_serving(&path, seams))
                 .await
@@ -1585,6 +1705,7 @@ mod tests {
             }),
             client_tasks: None,
             path_check_interval: super::PATH_CHECK_INTERVAL,
+            our_uid: super::effective_uid(),
         };
         let daemon = start_serving(&path, seams);
         let mut attached = wait_until_serving(&path).await;
@@ -1616,6 +1737,7 @@ mod tests {
             start_runner: idle_runner(),
             client_tasks: Some(std::sync::Arc::clone(&count)),
             path_check_interval: super::PATH_CHECK_INTERVAL,
+            our_uid: super::effective_uid(),
         };
         let daemon = start_serving(&path, seams);
         let held = |n: usize| {
@@ -1666,6 +1788,7 @@ mod tests {
                 start_runner: idle_runner(),
                 client_tasks: None,
                 path_check_interval: super::PATH_CHECK_INTERVAL,
+                our_uid: super::effective_uid(),
             },
         );
         let _attached = wait_until_serving(&path).await;
@@ -1708,6 +1831,7 @@ mod tests {
                 start_runner: idle_runner(),
                 client_tasks: None,
                 path_check_interval: Duration::from_millis(20),
+                our_uid: super::effective_uid(),
             },
         );
         let _attached = wait_until_serving(&path).await;
@@ -1721,8 +1845,9 @@ mod tests {
             let _ = daemon.await;
             return;
         }
-        // Well under five checks at the production interval (10 s), so this
-        // fails if the test interval is not the one the loop uses.
+        // Well under five checks at the production interval (2 s each, so
+        // about 10 s), so this fails if the test interval is not the one the
+        // loop uses.
         let outcome = tokio::time::timeout(Duration::from_secs(3), daemon)
             .await
             .expect("a daemon whose path stays unreadable must stop")
@@ -1779,5 +1904,462 @@ mod tests {
         for readable in [false, false, false, false, true, false, false, false, false] {
             streak = unreadable_streak(streak, readable).expect("never five in a row");
         }
+    }
+
+    // ── The socket directory (ROCMAI-456) ─────────────────────────────
+
+    /// A daemon with a runner that never stops, running as user `our_uid`.
+    fn idle_seams(our_uid: u32) -> ServeSeams {
+        ServeSeams {
+            start_runner: idle_runner(),
+            client_tasks: None,
+            path_check_interval: super::PATH_CHECK_INTERVAL,
+            our_uid,
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("{} should exist: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// A socket directory another user controls is refused before the daemon
+    /// creates, opens, probes or removes anything in it, and the refusal is a
+    /// failure, not "another daemon serves this path" -- which a dashboard
+    /// would keep waiting on without a word.
+    #[tokio::test]
+    async fn a_socket_directory_another_user_owns_is_refused_before_anything_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = shared.join("rocmdashd.sock");
+        stale_socket(&path);
+        pin_inode(&path);
+        let stale = inode(&path);
+        // The directory is this user's; a daemon running as someone else
+        // sees it as another user's.
+        let someone_else = super::effective_uid().wrapping_add(1);
+
+        let refusal =
+            tokio::time::timeout(DEADLINE, start_serving(&path, idle_seams(someone_else)))
+                .await
+                .expect("a refused directory must not be served")
+                .unwrap()
+                .expect_err("another user's directory must be refused");
+
+        assert!(in_use_path(&refusal).is_none(), "not in use: {refusal:#}");
+        assert!(
+            format!("{refusal:#}").contains(&unsecurable_socket_dir_context(&shared)),
+            "the refusal must name the directory and why: {refusal:#}"
+        );
+        assert!(
+            !socket_lock_path(&path).exists(),
+            "no lock file may be created in a refused directory"
+        );
+        assert_eq!(inode(&path), stale, "nothing in it may be removed");
+        assert_eq!(
+            mode_of(&shared),
+            0o755,
+            "a refused directory is not changed"
+        );
+    }
+
+    /// The lock is never taken through a symlink planted at its path: that
+    /// would create or lock a file wherever the link points.
+    #[tokio::test]
+    async fn a_symlink_at_the_lock_path_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let target = elsewhere.path().join("planted");
+        std::os::unix::fs::symlink(&target, socket_lock_path(&path)).unwrap();
+
+        let refusal = SocketClaim::claim(&path)
+            .await
+            .expect_err("a symlinked lock must be refused");
+
+        assert!(in_use_path(&refusal).is_none(), "{refusal:#}");
+        assert!(
+            !target.exists(),
+            "the link's target must not be created: {refusal:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(socket_lock_path(&path))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is left as it was"
+        );
+    }
+
+    /// A missing socket directory is created private, nested levels too, and
+    /// the socket in it is private to its owner.
+    #[tokio::test]
+    async fn serving_creates_a_missing_socket_directory_privately() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("nested").join("telemetry");
+        let path = socket_dir.join("rocmdashd.sock");
+        let daemon = start_serving(&path, idle_seams(super::effective_uid()));
+        let _attached = wait_until_serving(&path).await;
+
+        assert_eq!(mode_of(&socket_dir), 0o700);
+        assert_eq!(mode_of(&path), 0o600, "only the owner may connect");
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// An existing socket directory this user owns that others may write in is
+    /// restricted to `0o700` when the daemon serves it, and the socket to
+    /// `0o600`.
+    #[tokio::test]
+    async fn serving_restricts_a_socket_directory_it_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("loose");
+        std::fs::create_dir(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = socket_dir.join("rocmdashd.sock");
+        let daemon = start_serving(&path, idle_seams(super::effective_uid()));
+        let _attached = wait_until_serving(&path).await;
+
+        assert_eq!(mode_of(&socket_dir), 0o700);
+        assert_eq!(mode_of(&path), 0o600, "only the owner may connect");
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// A parent that cannot be inspected (here: a path through a regular
+    /// file) is reported as such, before anything is attempted in it.
+    #[tokio::test]
+    async fn a_socket_directory_that_cannot_be_inspected_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "keep me").unwrap();
+        let parent = file.join("telemetry");
+        let path = parent.join("rocmdashd.sock");
+
+        let refusal = tokio::time::timeout(
+            DEADLINE,
+            start_serving(&path, idle_seams(super::effective_uid())),
+        )
+        .await
+        .expect("an unusable directory must not be served")
+        .unwrap()
+        .expect_err("a directory that cannot be inspected must be refused");
+
+        assert!(
+            format!("{refusal:#}")
+                .contains(&format!("inspecting socket directory {}", parent.display())),
+            "{refusal:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+    }
+
+    /// Something that is not a directory where the socket's directory goes is
+    /// refused as such -- before whose it is matters -- and left alone.
+    #[tokio::test]
+    async fn a_socket_directory_that_is_not_a_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("telemetry");
+        std::fs::write(&parent, "keep me").unwrap();
+        let path = parent.join("rocmdashd.sock");
+        let someone_else = super::effective_uid().wrapping_add(1);
+
+        let refusal =
+            tokio::time::timeout(DEADLINE, start_serving(&path, idle_seams(someone_else)))
+                .await
+                .expect("an unusable directory must not be served")
+                .unwrap()
+                .expect_err("a file where the directory goes must be refused");
+
+        assert!(
+            format!("{refusal:#}").contains(&format!(
+                "socket directory {} is not a directory",
+                parent.display()
+            )),
+            "{refusal:#}"
+        );
+        assert!(in_use_path(&refusal).is_none(), "{refusal:#}");
+        assert_eq!(std::fs::read_to_string(&parent).unwrap(), "keep me");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "nothing may be created beside it"
+        );
+    }
+
+    /// A socket directory reached through a symlink is judged by the directory
+    /// the link resolves to -- the one the socket and its lock would really be
+    /// created in: a link to a writable directory of ours is served, and that
+    /// directory (not the link) is the one made private.
+    #[tokio::test]
+    async fn a_symlinked_socket_directory_is_judged_by_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("rocmdashd.sock");
+
+        let daemon = start_serving(&path, idle_seams(super::effective_uid()));
+        let _attached = wait_until_serving(&path).await;
+
+        assert!(real.join("rocmdashd.sock").exists());
+        assert_eq!(mode_of(&real), 0o700, "the target is made private");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link stays a link"
+        );
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// A link to a directory another user owns is refused as theirs -- its
+    /// target decides, not the link.
+    #[tokio::test]
+    async fn a_symlink_to_another_users_socket_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("rocmdashd.sock");
+        let someone_else = super::effective_uid().wrapping_add(1);
+
+        let refusal =
+            tokio::time::timeout(DEADLINE, start_serving(&path, idle_seams(someone_else)))
+                .await
+                .expect("a refused directory must not be served")
+                .unwrap()
+                .expect_err("another user's directory must be refused");
+
+        assert!(
+            format!("{refusal:#}").contains(&unsecurable_socket_dir_context(&link)),
+            "refused as another user's, not as something else: {refusal:#}"
+        );
+        assert!(!real.join("rocmdashd.sock.lock").exists());
+    }
+
+    /// A socket directory of ours that others may write in is made private
+    /// before the claim; checking an acceptable directory again changes
+    /// nothing -- a mode set between the two checks survives the second.
+    #[test]
+    fn a_loose_socket_directory_of_ours_is_made_private_before_the_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("loose");
+        std::fs::create_dir(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        super::check_socket_dir(&socket_dir, super::effective_uid())
+            .expect("our own directory is usable");
+
+        assert_eq!(mode_of(&socket_dir), 0o700);
+        assert_eq!(
+            std::fs::read_dir(&socket_dir).unwrap().count(),
+            0,
+            "the check creates nothing"
+        );
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        super::check_socket_dir(&socket_dir, super::effective_uid())
+            .expect("checking an acceptable directory again is fine");
+        assert_eq!(mode_of(&socket_dir), 0o750, "no chmod the second time");
+    }
+
+    /// At the call site: a directory of ours others may write in is already
+    /// private by the time the claim works in it. Here the claim then fails
+    /// (a symlink sits at the lock path), and the directory is 0700 anyway.
+    #[tokio::test]
+    async fn a_loose_socket_directory_is_tightened_before_the_claim_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("loose");
+        std::fs::create_dir(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = socket_dir.join("rocmdashd.sock");
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), socket_lock_path(&path)).unwrap();
+
+        let refusal = tokio::time::timeout(
+            DEADLINE,
+            start_serving(&path, idle_seams(super::effective_uid())),
+        )
+        .await
+        .expect("the claim must fail, not serve")
+        .unwrap()
+        .expect_err("a symlinked lock must be refused");
+
+        assert!(
+            format!("{refusal:#}").contains("opening socket lock"),
+            "it is the claim that failed: {refusal:#}"
+        );
+        assert_eq!(mode_of(&socket_dir), 0o700);
+    }
+
+    /// The decision is the directory owner's: a writable directory of another
+    /// user is refused, never chmodded.
+    #[tokio::test]
+    async fn another_users_writable_socket_directory_is_refused_not_chmodded() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("theirs");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = shared.join("rocmdashd.sock");
+        let someone_else = super::effective_uid().wrapping_add(1);
+
+        let refusal =
+            tokio::time::timeout(DEADLINE, start_serving(&path, idle_seams(someone_else)))
+                .await
+                .expect("a refused directory must not be served")
+                .unwrap()
+                .expect_err("another user's directory must be refused");
+
+        assert!(
+            format!("{refusal:#}").contains(&unsecurable_socket_dir_context(&shared)),
+            "{refusal:#}"
+        );
+        assert_eq!(mode_of(&shared), 0o775, "it is not chmodded");
+        assert!(!socket_lock_path(&path).exists());
+    }
+
+    /// A sticky directory is never chmodded, ours included: it is shared on
+    /// purpose, and only an entry's owner may remove the entry, so our `0o600`
+    /// socket and lock cannot be replaced in it.
+    #[tokio::test]
+    async fn a_sticky_socket_directory_is_served_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let path = shared.join("rocmdashd.sock");
+
+        let daemon = start_serving(&path, idle_seams(super::effective_uid()));
+        let _attached = wait_until_serving(&path).await;
+
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o1777,
+            "a sticky directory keeps its mode"
+        );
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// `check_socket_dir` says a sticky directory others may write in is
+    /// shared, which is what the warning after the claim keys on, and that a
+    /// private one is not.
+    #[test]
+    fn a_sticky_socket_directory_is_reported_as_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let private = dir.path().join("private");
+        for (path, mode) in [(&shared, 0o1777), (&private, 0o700)] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        assert!(check_socket_dir(&shared, effective_uid()).unwrap());
+        assert!(!check_socket_dir(&private, effective_uid()).unwrap());
+    }
+
+    /// A writer the tests' own `tracing` subscriber logs into.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The shared-sticky-directory warning is given once, by the daemon that
+    /// claims the path -- not by one that finds the path owned and retries.
+    /// The daemons run on this test's thread (`#[tokio::test]` is
+    /// single-threaded), where the subscriber is installed.
+    #[tokio::test]
+    async fn the_shared_directory_warning_comes_once_from_the_daemon_that_claims_the_path() {
+        let captured = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(captured.clone())
+                .finish(),
+        );
+        let warnings = || {
+            String::from_utf8_lossy(&captured.0.lock().unwrap())
+                .matches("shared sticky directory")
+                .count()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let path = shared.join("rocmdashd.sock");
+
+        let daemon = start_serving(&path, idle_seams(super::effective_uid()));
+        let _attached = wait_until_serving(&path).await;
+        assert_eq!(warnings(), 1, "the daemon that claimed the path warns once");
+
+        let refusal = tokio::time::timeout(
+            DEADLINE,
+            start_serving(&path, idle_seams(super::effective_uid())),
+        )
+        .await
+        .expect("a second daemon must give up")
+        .unwrap()
+        .expect_err("the path is owned");
+        assert_eq!(in_use_holder(&refusal), Some(SocketHolder::LockHolder));
+        assert_eq!(
+            warnings(),
+            1,
+            "a daemon that found the path owned does not warn"
+        );
+
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
+    /// A socket directory that had to be created is judged afterwards like
+    /// any existing one: `create` also succeeds when someone else made it
+    /// first, so what is there is checked again. Here the daemon runs as a
+    /// different uid (`ServeSeams::our_uid`), so the directory it just made
+    /// counts as another user's and is refused. (The race itself -- another
+    /// user creating it between the stat and the mkdir -- is not driven.)
+    #[tokio::test]
+    async fn a_socket_directory_just_created_is_judged_like_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("made");
+        let path = socket_dir.join("rocmdashd.sock");
+        let someone_else = super::effective_uid().wrapping_add(1);
+
+        let refusal =
+            tokio::time::timeout(DEADLINE, start_serving(&path, idle_seams(someone_else)))
+                .await
+                .expect("a refused directory must not be served")
+                .unwrap()
+                .expect_err("a directory that is not ours must be refused");
+
+        assert!(
+            format!("{refusal:#}").contains(&unsecurable_socket_dir_context(&socket_dir)),
+            "{refusal:#}"
+        );
+        assert!(socket_dir.is_dir(), "it was created");
+        assert!(!socket_lock_path(&path).exists());
     }
 }
