@@ -15,8 +15,10 @@
 # users are told is supported, and a runner floor above it would hide a
 # regression on the oldest supported host. The two must not drift silently,
 # so `host_baseline_contract.rs` in xtask fails when these constants and the
-# README sentence disagree. Raising the CI floor is a separate decision from
-# raising the product floor; make it there, not here.
+# README sentence's glibc/GLIBCXX pair disagree. The Ubuntu release that
+# sentence also names is not compared: raising the floor means updating it,
+# and `WSL_MIN_UBUNTU` in rocm-core, by hand. The floor is set in README.md:
+# raising it is a product decision made there, and these constants follow it.
 #
 # WHAT IS CHECKED, AND WHAT IS NOT. glibc through `getconf GNU_LIBC_VERSION`,
 # and the newest GLIBCXX symbol version in the first x86-64 libstdc++ the
@@ -33,9 +35,9 @@
 # that could not be read. An unreadable runtime is not evidence of a good one.
 #
 # Env:
-#   HOST_BASELINE_OS_RELEASE    os-release file to log the OS name from.
-#                               Default: /etc/os-release, then
-#                               /usr/lib/os-release.
+#   HOST_BASELINE_OS_RELEASE    space-separated os-release files to log the
+#                               OS name from; the first readable one is used.
+#                               Default: /etc/os-release /usr/lib/os-release.
 #   HOST_BASELINE_LDCONFIG_DIRS space-separated directories searched for
 #                               ldconfig when it is not on PATH. Default:
 #                               /usr/sbin /sbin.
@@ -61,12 +63,11 @@ version_ge() {
   [[ "${lowest}" == "$2" ]]
 }
 
+# The first readable file wins even when it names no release, as os-release(5)
+# has /etc/os-release take precedence and /usr/lib/os-release serve only in its
+# absence.
 os_name="unknown"
-if [[ -n "${HOST_BASELINE_OS_RELEASE:-}" ]]; then
-  os_release_files=("${HOST_BASELINE_OS_RELEASE}")
-else
-  os_release_files=(/etc/os-release /usr/lib/os-release)
-fi
+read -r -a os_release_files <<<"${HOST_BASELINE_OS_RELEASE:-/etc/os-release /usr/lib/os-release}"
 for f in "${os_release_files[@]}"; do
   if [[ -r "${f}" ]]; then
     name="$(sed -n 's/^PRETTY_NAME=//p' "${f}" | head -n 1 | tr -d '"'"'")"
@@ -130,7 +131,11 @@ symbols="$(grep -aoE 'GLIBCXX_3\.4(\.[0-9]+)?' "${libstdcxx}")" || grep_rc=$?
 if [[ "${grep_rc}" -gt 1 ]]; then
   fail "grep could not read ${libstdcxx} (exit ${grep_rc})"
 fi
-glibcxx="$(printf '%s\n' "${symbols}" | sed -n 's/^GLIBCXX_//p' | sort -uV | tail -n 1)"
+# pipefail is what makes a failed `sort` reach this `||`: without it the
+# pipeline takes `tail`'s status, and an empty ranking would be reported below
+# as a library with no versions in it.
+glibcxx="$(printf '%s\n' "${symbols}" | sed -n 's/^GLIBCXX_//p' | sort -uV | tail -n 1)" ||
+  fail "could not rank the GLIBCXX versions read from ${libstdcxx}"
 if [[ -z "${glibcxx}" ]]; then
   fail "${libstdcxx} carries no GLIBCXX_3.4 symbol version"
 fi

@@ -12,9 +12,14 @@
 //!   fixture file carrying `GLIBCXX_*` version strings, so every outcome —
 //!   met, short on either value, unreadable — is reached without needing a
 //!   host that has it; and
-//! * that the floor it asserts is the product's: the constants in the script
-//!   must equal the "glibc X with `GLIBCXX_Y`" sentence in `README.md` and
-//!   the same pair in `docs/wsl.md`, so neither side can move alone.
+//! * that the glibc/`GLIBCXX` pair it asserts is the product's: the constants
+//!   in the script must equal the "glibc X with `GLIBCXX_Y`" sentence in
+//!   `README.md`, and each place that restates the pair (`docs/wsl.md`, the
+//!   WSL distro check and its fix recipe in `rocm-core`, the rocm-doctor
+//!   skill's reference) must agree with it, so no side can move alone. Only
+//!   the pair is tied: the Ubuntu release the same texts name (README.md,
+//!   `docs/wsl.md`, `WSL_MIN_UBUNTU` in `rocm-core`) is not compared, so
+//!   raising the floor also means checking those by hand.
 //!
 //! Where the script sits in the preflight, and that a failing baseline stops
 //! it before any GPU query, is `workflow_contract.rs`'s to drive.
@@ -78,10 +83,26 @@ mod tests {
         found.into_iter().next().expect("one match")
     }
 
+    /// Files outside README.md that restate the floor as "2.38 /
+    /// `GLIBCXX_3.4.32`", each exactly once: the WSL distro check's message
+    /// and the comments beside it, the fix recipe's rationale, and the
+    /// rocm-doctor skill's failure catalog. Each must select xtask when it
+    /// alone changes, or an edit to it skips the test that reads it:
+    /// `every_floor_file_selects_the_test_that_reads_it` holds that.
+    const SLASH_FLOOR_RESTATEMENTS: [&str; 5] = [
+        "crates/rocm-core/src/diagnose/wsl.rs",
+        "crates/rocm-core/src/examine.rs",
+        "crates/rocm-core/src/examine/wsl.rs",
+        "crates/rocm-core/src/fix/catalog.rs",
+        "skills/rocm-doctor/reference.md",
+    ];
+
     /// The CI floor is the product floor, on purpose: a runner below it cannot
     /// run what users are told is supported, and one held above it would hide
     /// a break on the oldest supported host. Raising either is a decision, and
-    /// this makes sure it is taken for both at once.
+    /// this makes sure it is taken for both at once — and that every place
+    /// that tells a user the glibc/`GLIBCXX` pair moves with it. The Ubuntu
+    /// release name those places also carry is not compared.
     #[test]
     fn the_ci_host_floor_is_the_documented_product_floor() {
         let script = script_floor();
@@ -89,19 +110,58 @@ mod tests {
             "README.md",
             r"glibc (\d+\.\d+) with `GLIBCXX_(\d+\.\d+\.\d+)`",
         );
-        let wsl = doc_floor(
-            "docs/wsl.md",
-            r"\(glibc (\d+\.\d+) and `GLIBCXX_(\d+\.\d+\.\d+)`\)",
-        );
         assert_eq!(
             script, readme,
             "{SCRIPT} asserts (glibc, GLIBCXX_) {script:?} but README.md states the product \
              floor as {readme:?}; the CI runner floor must equal the product floor"
         );
+        let wsl = doc_floor(
+            "docs/wsl.md",
+            r"\(glibc (\d+\.\d+) and `GLIBCXX_(\d+\.\d+\.\d+)`\)",
+        );
         assert_eq!(
             wsl, readme,
             "docs/wsl.md states the floor as {wsl:?} and README.md as {readme:?}"
         );
+        for rel in SLASH_FLOOR_RESTATEMENTS {
+            let restated = doc_floor(rel, r"(\d+\.\d+) / `?GLIBCXX_(\d+\.\d+\.\d+)`?");
+            assert_eq!(
+                restated, readme,
+                "{rel} states the floor as {restated:?} and README.md as {readme:?}"
+            );
+        }
+    }
+
+    /// Every file `the_ci_host_floor_is_the_documented_product_floor` reads
+    /// runs it when that file alone changes: a Markdown file only by being in
+    /// `XTASK_READ_DOCS`, which also puts it in ci.yml's `rust` bucket (see
+    /// `forces_full_workspace_docs_are_in_the_rust_filter`), and a Rust file
+    /// by belonging to a crate xtask depends on.
+    #[test]
+    fn every_floor_file_selects_the_test_that_reads_it() {
+        let graph = crate::affected::load_graph().expect("read the workspace graph");
+        for rel in ["README.md", "docs/wsl.md"]
+            .into_iter()
+            .chain(SLASH_FLOOR_RESTATEMENTS)
+        {
+            if Path::new(rel).extension().is_some_and(|e| e == "rs") {
+                let selection = crate::affected::select(&[rel.to_owned()], &graph);
+                assert!(
+                    match &selection {
+                        crate::affected::Selection::Workspace => true,
+                        crate::affected::Selection::Packages(names) => names.contains("xtask"),
+                        crate::affected::Selection::Empty => false,
+                    },
+                    "an edit to {rel} alone selects {selection:?}, which does not run xtask"
+                );
+            } else {
+                assert!(
+                    crate::affected::XTASK_READ_DOCS.contains(&rel),
+                    "{rel} states the floor but is not in XTASK_READ_DOCS (affected.rs), so an \
+                     edit to it alone does not run the test that reads it"
+                );
+            }
+        }
     }
 
     /// How the stubbed `getconf GNU_LIBC_VERSION` behaves.
@@ -123,6 +183,9 @@ mod tests {
         /// Off `PATH`, in the directory the script falls back to — the
         /// `/usr/sbin` of a non-root `PATH` — printing the cache.
         InFallbackDir,
+        /// In the fallback directory but without its execute bit, which is
+        /// not an ldconfig the script can run.
+        NotExecutableInFallbackDir,
         /// Nowhere the script looks.
         Missing,
         /// On `PATH`, but `ldconfig -p` fails.
@@ -146,10 +209,22 @@ mod tests {
         /// The ABI tag in the cache line's parentheses, e.g. `libc6,x86-64`.
         abi: &'static str,
         /// The newest `GLIBCXX_3.4.N` the fixture file carries; every older
-        /// one is present too, as in a real library. 0 means a file with no
-        /// `GLIBCXX_3.4*` version at all.
-        newest: u32,
+        /// one is present too, as in a real library, and so is the bare
+        /// `GLIBCXX_3.4`. `Some(0)` is a file with only that bare version;
+        /// `None` is one with no `GLIBCXX_3.4*` version at all.
+        newest: Option<u32>,
         file: LibFile,
+    }
+
+    /// One file named in `HOST_BASELINE_OS_RELEASE`, in order.
+    #[cfg(unix)]
+    enum OsRelease {
+        /// Not there.
+        Absent,
+        /// There, with this `PRETTY_NAME`.
+        Named(&'static str),
+        /// There, with no `PRETTY_NAME` line.
+        Unnamed,
     }
 
     #[cfg(unix)]
@@ -160,8 +235,12 @@ mod tests {
         /// Unrelated x86-64 entries listed after the libstdc++ ones, the bulk
         /// of a real cache.
         filler: usize,
-        /// `PRETTY_NAME` of the os-release file, or `None` for no file.
-        os: Option<&'static str>,
+        /// The os-release files handed to the script, first first, or `None`
+        /// to leave `HOST_BASELINE_OS_RELEASE` unset so the script reads its
+        /// default list, this host's own files.
+        os_release: Option<Vec<OsRelease>>,
+        /// `HOST_TOOLS` left off `PATH`.
+        missing_tools: &'static [&'static str],
     }
 
     /// Tools the script calls that are not stubbed. `PATH` holds these and the
@@ -182,13 +261,13 @@ mod tests {
     /// way they sit in the real file's `.gnu.version_d` string table, plus
     /// look-alikes that must not count.
     #[cfg(unix)]
-    fn libstdcxx_fixture(newest: u32) -> Vec<u8> {
+    fn libstdcxx_fixture(newest: Option<u32>) -> Vec<u8> {
         let mut bytes = b"\x7fELF\0\0CXXABI_1.3\0GLIBCXX_TUNABLES\0".to_vec();
-        if newest > 0 {
+        if let Some(newest) = newest {
             bytes.extend_from_slice(b"GLIBCXX_3.4\0");
-        }
-        for n in 1..=newest {
-            bytes.extend_from_slice(format!("GLIBCXX_3.4.{n}\0").as_bytes());
+            for n in 1..=newest {
+                bytes.extend_from_slice(format!("GLIBCXX_3.4.{n}\0").as_bytes());
+            }
         }
         bytes.extend_from_slice(b"CXXABI_1.3.15\0");
         bytes
@@ -204,7 +283,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let tools = dir.path().join("tools");
         std::fs::create_dir(&tools).expect("tools dir");
-        for tool in HOST_TOOLS {
+        for tool in HOST_TOOLS
+            .into_iter()
+            .filter(|t| !case.missing_tools.contains(t))
+        {
             std::os::unix::fs::symlink(host_tool(tool), tools.join(tool)).expect("link a tool");
         }
         match case.getconf {
@@ -266,6 +348,7 @@ mod tests {
         match case.ldconfig {
             Ldconfig::OnPath => write_fake_executable(&tools.join("ldconfig"), printing),
             Ldconfig::InFallbackDir => write_fake_executable(&sbin.join("ldconfig"), printing),
+            Ldconfig::NotExecutableInFallbackDir => std::fs::write(sbin.join("ldconfig"), printing),
             Ldconfig::Missing => Ok(()),
             Ldconfig::Fails => write_fake_executable(
                 &tools.join("ldconfig"),
@@ -273,23 +356,29 @@ mod tests {
             ),
         }
         .expect("plant ldconfig");
-        let os_release = dir.path().join("os-release");
-        if let Some(name) = case.os {
-            std::fs::write(
-                &os_release,
-                format!("NAME=x\nPRETTY_NAME=\"{name}\"\nID=x\n"),
-            )
-            .expect("write os-release");
+        let mut os_release_paths = Vec::new();
+        for (i, entry) in case.os_release.iter().flatten().enumerate() {
+            let path = dir.path().join(format!("os-release{i}"));
+            let body = match entry {
+                OsRelease::Absent => None,
+                OsRelease::Named(name) => Some(format!("NAME=x\nPRETTY_NAME=\"{name}\"\nID=x\n")),
+                OsRelease::Unnamed => Some("NAME=x\nID=x\n".to_owned()),
+            };
+            if let Some(body) = body {
+                std::fs::write(&path, body).expect("write os-release");
+            }
+            os_release_paths.push(path.display().to_string());
         }
 
-        let out = std::process::Command::new(host_tool("bash"))
-            .arg(repo_root().join(SCRIPT))
+        let mut cmd = std::process::Command::new(host_tool("bash"));
+        cmd.arg(repo_root().join(SCRIPT))
             .env_clear()
             .env("PATH", &tools)
-            .env("HOST_BASELINE_OS_RELEASE", &os_release)
-            .env("HOST_BASELINE_LDCONFIG_DIRS", &sbin)
-            .output()
-            .expect("running host-baseline.sh");
+            .env("HOST_BASELINE_LDCONFIG_DIRS", &sbin);
+        if case.os_release.is_some() {
+            cmd.env("HOST_BASELINE_OS_RELEASE", os_release_paths.join(" "));
+        }
+        let out = cmd.output().expect("running host-baseline.sh");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.code().expect("exited, not signalled"), log)
@@ -299,7 +388,7 @@ mod tests {
     fn x86_64(newest: u32) -> Lib {
         Lib {
             abi: "libc6,x86-64",
-            newest,
+            newest: Some(newest),
             file: LibFile::Fixture,
         }
     }
@@ -311,7 +400,8 @@ mod tests {
             ldconfig: Ldconfig::OnPath,
             libs,
             filler: 0,
-            os: Some("Ubuntu 24.04.1 LTS"),
+            os_release: Some(vec![OsRelease::Named("Ubuntu 24.04.1 LTS")]),
+            missing_tools: &[],
         }
     }
 
@@ -463,14 +553,22 @@ mod tests {
         );
     }
 
+    /// The whole line must be "glibc" and a version: a version with
+    /// something before or after it is not one this check can trust.
     #[cfg(unix)]
     #[test]
     fn an_unparseable_glibc_version_fails() {
-        assert_fails(
-            &host("glibc two-point-thirty-nine", vec![x86_64(33)]),
-            "Ubuntu 24.04.1 LTS",
-            "getconf GNU_LIBC_VERSION printed 'glibc two-point-thirty-nine', not a glibc version",
-        );
+        for line in [
+            "glibc two-point-thirty-nine",
+            "glibc 2.39 (Debian)",
+            "eglibc 2.39",
+        ] {
+            assert_fails(
+                &host(line, vec![x86_64(33)]),
+                "Ubuntu 24.04.1 LTS",
+                &format!("getconf GNU_LIBC_VERSION printed '{line}', not a glibc version"),
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -488,12 +586,40 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_libstdcxx_with_no_glibcxx_version_fails() {
-        let (code, log) = run(&host("glibc 2.39", vec![x86_64(0)]));
+        let mut lib = x86_64(0);
+        lib.newest = None;
+        let (code, log) = run(&host("glibc 2.39", vec![lib]));
         let re = regex::Regex::new(
             r"^::error::host baseline not met on Ubuntu 24\.04\.1 LTS: /\S+/lib0/libstdc\+\+\.so\.6 carries no GLIBCXX_3\.4 symbol version \(floor glibc 2\.38, GLIBCXX_3\.4\.32; see README\.md\)$",
         )
         .expect("pattern compiles");
         assert!(re.is_match(log.trim_end()), "exit {code}, logged:\n{log}");
+        assert_eq!(code, 1, "{log}");
+    }
+
+    /// A library whose only version is the bare `GLIBCXX_3.4` is judged on
+    /// it, and is below the floor, rather than read as carrying none.
+    #[cfg(unix)]
+    #[test]
+    fn a_libstdcxx_with_only_the_bare_glibcxx_3_4_is_judged_on_it() {
+        assert_fails_on_glibcxx(&host("glibc 2.39", vec![x86_64(0)]), "", "3.4");
+    }
+
+    /// A ranking that failed is a failed read, not a library with no versions
+    /// in it: the script runs under `pipefail` so a broken stage is seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_whose_versions_cannot_be_ranked_fails_as_a_read_error() {
+        let mut case = host("glibc 2.39", vec![x86_64(33)]);
+        case.missing_tools = &["sort"];
+        let (code, log) = run(&case);
+        let re = regex::Regex::new(
+            r"(?m)^::error::host baseline not met on Ubuntu 24\.04\.1 LTS: could not rank the GLIBCXX versions read from /\S+/lib0/libstdc\+\+\.so\.6 \(floor glibc 2\.38, GLIBCXX_3\.4\.32; see README\.md\)$",
+        )
+        .expect("pattern compiles");
+        // bash's own "command not found" follows on stderr; the verdict line
+        // is what is pinned.
+        assert!(re.is_match(&log), "exit {code}, logged:\n{log}");
         assert_eq!(code, 1, "{log}");
     }
 
@@ -505,12 +631,12 @@ mod tests {
     fn only_the_x86_64_libstdcxx_is_judged() {
         let x32 = |newest| Lib {
             abi: "libc6,x32",
-            newest,
+            newest: Some(newest),
             file: LibFile::Fixture,
         };
         let i386 = |newest| Lib {
             abi: "libc6",
-            newest,
+            newest: Some(newest),
             file: LibFile::Fixture,
         };
         assert_passes(
@@ -586,6 +712,19 @@ mod tests {
         );
     }
 
+    /// A file called ldconfig that cannot be executed is not an ldconfig.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_ldconfig_in_sbin_is_not_used() {
+        let mut case = host("glibc 2.39", vec![x86_64(33)]);
+        case.ldconfig = Ldconfig::NotExecutableInFallbackDir;
+        assert_fails(
+            &case,
+            "Ubuntu 24.04.1 LTS",
+            "ldconfig is not installed, so libstdc++ cannot be located",
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failing_ldconfig_fails() {
@@ -636,7 +775,7 @@ mod tests {
     #[test]
     fn a_non_ubuntu_host_with_the_libraries_passes() {
         let mut case = host("glibc 2.40", vec![x86_64(33)]);
-        case.os = Some("Fedora Linux 41 (Server Edition)");
+        case.os_release = Some(vec![OsRelease::Named("Fedora Linux 41 (Server Edition)")]);
         assert_passes(&case, "Fedora Linux 41 (Server Edition)", "2.40", "3.4.33");
     }
 
@@ -644,7 +783,110 @@ mod tests {
     #[test]
     fn a_host_without_os_release_passes_and_says_unknown() {
         let mut case = host("glibc 2.39", vec![x86_64(33)]);
-        case.os = None;
+        case.os_release = Some(vec![OsRelease::Absent]);
         assert_passes(&case, "unknown", "2.39", "3.4.33");
+    }
+
+    /// Of the files listed, the second is read when the first is absent, and
+    /// the first readable one wins outright, named or not, as os-release(5)
+    /// has it for /etc/os-release and /usr/lib/os-release.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_readable_os_release_names_the_host() {
+        for (files, os) in [
+            (
+                vec![
+                    OsRelease::Absent,
+                    OsRelease::Named("Debian GNU/Linux 13 (trixie)"),
+                ],
+                "Debian GNU/Linux 13 (trixie)",
+            ),
+            (
+                vec![
+                    OsRelease::Named("Ubuntu 24.04.1 LTS"),
+                    OsRelease::Named("Debian"),
+                ],
+                "Ubuntu 24.04.1 LTS",
+            ),
+            (
+                vec![OsRelease::Unnamed, OsRelease::Named("Debian")],
+                "unknown",
+            ),
+        ] {
+            let mut case = host("glibc 2.39", vec![x86_64(33)]);
+            case.os_release = Some(files);
+            assert_passes(&case, os, "2.39", "3.4.33");
+        }
+    }
+
+    /// The script's default os-release list, written out: /etc/os-release,
+    /// then /usr/lib/os-release, the order os-release(5) gives them.
+    const DEFAULT_OS_RELEASE: [&str; 2] = ["/etc/os-release", "/usr/lib/os-release"];
+
+    /// The directories the script searches for `ldconfig` when it is off PATH,
+    /// written out: the sbin directories a non-root shell leaves out.
+    const DEFAULT_LDCONFIG_DIRS: [&str; 2] = ["/usr/sbin", "/sbin"];
+
+    /// Every default the script gives `var` (the text after `${var:-` up to the
+    /// closing brace), one entry per occurrence outside comments.
+    fn declared_defaults(script: &str, var: &str) -> Vec<String> {
+        let opener = format!("${{{var}:-");
+        script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .flat_map(|l| l.split(opener.as_str()).skip(1))
+            .map(|rest| {
+                rest.split('}')
+                    .next()
+                    .expect("split yields one item")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The script declares exactly [`DEFAULT_OS_RELEASE`] and
+    /// [`DEFAULT_LDCONFIG_DIRS`], each in one place and in that order, so
+    /// dropping or reordering an entry of either list fails here. This pins
+    /// only what the script declares: that the defaults are used at runtime is
+    /// `the_default_os_release_list_names_this_host`'s to show for os-release,
+    /// and `preflight_runs_the_real_host_baseline`'s (workflow_contract.rs)
+    /// for both, since each leaves its variable unset. That the os-release
+    /// list is walked in order, the first readable file winning, is
+    /// `the_first_readable_os_release_names_the_host`'s to show with fixtures.
+    #[test]
+    fn the_script_declares_its_default_search_lists() {
+        for (var, want) in [
+            ("HOST_BASELINE_OS_RELEASE", DEFAULT_OS_RELEASE),
+            ("HOST_BASELINE_LDCONFIG_DIRS", DEFAULT_LDCONFIG_DIRS),
+        ] {
+            assert_eq!(
+                declared_defaults(&read(SCRIPT), var),
+                [want.join(" ")],
+                "{SCRIPT} must default {var} to {want:?}, in that order, in exactly one place"
+            );
+        }
+    }
+
+    /// With `HOST_BASELINE_OS_RELEASE` unset the script really does fall back
+    /// to the default list rather than to nothing: the name it logs is this
+    /// host's, read the same way. On a host with /etc/os-release, CI's
+    /// included, that run reads only the first entry; which entries the list
+    /// holds is `the_script_declares_its_default_search_lists`'s to pin.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_os_release_list_names_this_host() {
+        let expected = DEFAULT_OS_RELEASE
+            .into_iter()
+            .find_map(|f| std::fs::read_to_string(f).ok())
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+                    .map(|v| v.replace(['"', '\''], ""))
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let mut case = host("glibc 2.39", vec![x86_64(33)]);
+        case.os_release = None;
+        assert_passes(&case, &expected, "2.39", "3.4.33");
     }
 }

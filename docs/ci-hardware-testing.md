@@ -253,9 +253,9 @@ covers the mock platform;
 `e2e-selfhosted.yml`'s `e2e-report` covers its self-hosted GPU platforms (a
 pull request runs only the MI300X and Windows Strix Halo pool lanes among them);
 `nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
-platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
-per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
-included. Each joins its platforms'
+platforms (it also runs `e2e-gpu-nightly-rad3` and
+`e2e-gpu-nightly-mi350p`, demoted from per-PR to nightly-only per ROCMAI-125)
+with the `@nightly` scenarios included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary. Since ROCMAI-429 the report keys each column by
 `(platform_slug, channel)` rather than platform alone, so `nightly.yml`'s
@@ -376,9 +376,14 @@ The CI floor equals the product floor on purpose. A runner below it cannot run
 what users are told is supported, and a floor raised above it would hide a
 break on the oldest host the product supports. `host_baseline_contract.rs` in
 [`xtask`](../xtask/src/host_baseline_contract.rs) fails when the script's
-constants and the README sentence (or the same pair in [wsl.md](wsl.md))
-disagree, so raising the CI floor is a change to the product's support floor,
-made as its own decision rather than on the runners alone.
+constants and the README sentence's glibc/`GLIBCXX` pair disagree, or when a
+place that restates the pair — [wsl.md](wsl.md), the WSL distro check and its
+fix recipe in `rocm-core`, or the rocm-doctor skill's
+[reference.md](../skills/rocm-doctor/reference.md) — disagrees with README.md, so
+raising the CI floor is a change to the product's support floor, made as its
+own decision rather than on the runners alone. The Ubuntu release those texts
+also name (README.md, wsl.md, `WSL_MIN_UBUNTU` in `rocm-core`) is not compared
+by any test, so raising the floor also means updating it by hand.
 
 The WSL lanes meet the floor by construction: each run installs a fresh
 Ubuntu-24.04 distro (see "Platforms" above), and they do not run the shared
