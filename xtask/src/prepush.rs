@@ -213,12 +213,19 @@ fn package_args<'a>(packages: Option<impl Iterator<Item = &'a str>>) -> Vec<Stri
 ///   other docs.
 /// - the e2e PowerShell fixture: `rocm-core`'s `fix` tests `include_str!` it
 ///   although it lives in the e2e crate.
+/// - the e2e Lemonade install steps: `rocm-engine-lemonade`'s `alignment_record`
+///   tests `include_str!` them to check the record's file name the steps
+///   hard-code still matches the engine's.
 pub(crate) const CROSS_CRATE_READS: &[(&str, &[&str])] = &[
     ("*.rs", &["xtask"]),
     ("README.md", &["rocm", "xtask"]),
     ("docs/", &["rocm", "xtask"]),
     ("skills/", &["rocm", "xtask"]),
     ("tests/e2e-cucumber/fixtures/", &["rocm-core"]),
+    (
+        "tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs",
+        &["rocm-engine-lemonade"],
+    ),
 ];
 
 fn read_pattern_matches(pattern: &str, file: &str) -> bool {

@@ -992,8 +992,10 @@ pushed (`PRE_COMMIT_FROM_REF..PRE_COMMIT_TO_REF`, the commits the remote does no
 The directory-based selection cannot see a crate's tests reading a file from outside the crate,
 so the hook widens it: any Rust file also selects `xtask` (its contract tests scan every source
 file), `README.md`, `docs/` and `skills/` also select `rocm` and `xtask` (the advised-commands
-test reads them and `rocm` compiles in the assistant skill), and the e2e PowerShell fixture also
-selects `rocm-core` (its tests `include_str!` it). The table is `CROSS_CRATE_READS` in
+test reads them and `rocm` compiles in the assistant skill), the e2e PowerShell fixture also
+selects `rocm-core` (its tests `include_str!` it), and the e2e Lemonade install steps also select
+`rocm-engine-lemonade` (its `alignment_record` tests `include_str!` them to check the record's file
+name). The table is `CROSS_CRATE_READS` in
 [prepush.rs](../xtask/src/prepush.rs), and a unit test scans the workspace for `include_str!`,
 `include_bytes!` and manifest-relative reads that leave their crate and fails when one is not
 covered, so a new cross-crate read cannot be added without a decision. The scan has a limit: a read
