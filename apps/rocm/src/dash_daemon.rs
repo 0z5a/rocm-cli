@@ -120,9 +120,13 @@ pub(crate) async fn spawn_keeper(
         // Poll until something accepts connections; a fixed sleep is
         // race-prone on slow or loaded systems. Stop waiting as soon as the
         // daemon has failed: nothing will answer, and the TUI client keeps
-        // reconnecting on its own.
+        // reconnecting on its own. Probe with `socket_answers`, which reads
+        // the daemon's greeting before hanging up: a bare connect that hung
+        // up first would have the daemon log a client error for every
+        // dashboard opened. `the_probe_waits_for_the_greeting_before_hanging_up`
+        // (rocm-dash-daemon's server.rs) proves the probe reads the greeting.
         let deadline = tokio::time::Instant::now() + READY_WAIT;
-        while tokio::net::UnixStream::connect(target).await.is_err()
+        while !rocm_dash_daemon::server::socket_answers(Path::new(target)).await
             && tokio::time::Instant::now() < deadline
             && keeper.failure.lock().is_ok_and(|slot| slot.is_none())
         {
@@ -219,10 +223,11 @@ pub(crate) async fn stop_keeper(keeper: Keeper) -> Option<KeeperFailure> {
             socket,
             error: match &recorded {
                 Some(before) => format!(
-                    "its keeper stopped unexpectedly: {error} (before that: {})",
+                    "the dashboard's supervision of it stopped unexpectedly: {error} \
+                     (before that: {})",
                     before.error
                 ),
-                None => format!("its keeper stopped unexpectedly: {error}"),
+                None => format!("the dashboard's supervision of it stopped unexpectedly: {error}"),
             },
             failed_attempts: recorded.as_ref().map_or(0, |before| before.failed_attempts),
             served: served.load(Ordering::SeqCst),
@@ -948,7 +953,10 @@ mod tests {
             .await
             .expect("a panicked keeper must be reported");
         assert_eq!(failure.socket, path);
-        assert_eq!(failure.error, "its keeper stopped unexpectedly: keeper bug");
+        assert_eq!(
+            failure.error,
+            "the dashboard's supervision of it stopped unexpectedly: keeper bug"
+        );
     }
 
     /// A keeper whose task panicked, after its daemon served (`served`) or not.
@@ -984,8 +992,8 @@ mod tests {
         assert_eq!(
             failure_report(&failure, Path::new(LOG_DIR)),
             format!(
-                "{REPORT_STOPPED_SERVING} {}: its keeper stopped unexpectedly: keeper bug\n\
-                 {REPORT_LOG_LINE} {LOG_DIR}",
+                "{REPORT_STOPPED_SERVING} {}: the dashboard's supervision of it stopped \
+                 unexpectedly: keeper bug\n{REPORT_LOG_LINE} {LOG_DIR}",
                 path.display()
             )
         );
@@ -1009,9 +1017,12 @@ mod tests {
 
         assert_eq!(
             formatted.error,
-            "its keeper stopped unexpectedly: keeper bug 7"
+            "the dashboard's supervision of it stopped unexpectedly: keeper bug 7"
         );
-        assert_eq!(opaque.error, "its keeper stopped unexpectedly: panicked");
+        assert_eq!(
+            opaque.error,
+            "the dashboard's supervision of it stopped unexpectedly: panicked"
+        );
     }
 
     /// A keeper whose task panicked, built with `recorded` as the failure its
@@ -1056,7 +1067,9 @@ mod tests {
             failure,
             Some(KeeperFailure {
                 socket: path.clone(),
-                error: "its keeper stopped unexpectedly: keeper bug (before that: refused)".into(),
+                error: "the dashboard's supervision of it stopped unexpectedly: keeper bug \
+                        (before that: refused)"
+                    .into(),
                 failed_attempts: 3,
                 served: false,
                 logged: true,
@@ -1065,8 +1078,9 @@ mod tests {
         assert_eq!(
             failure_report(&failure.unwrap(), Path::new(LOG_DIR)),
             format!(
-                "{REPORT_COULD_NOT_START} {}: its keeper stopped unexpectedly: keeper bug \
-                 (before that: refused) (3 failed attempts)\n{REPORT_LOG_LINE} {LOG_DIR}",
+                "{REPORT_COULD_NOT_START} {}: the dashboard's supervision of it stopped \
+                 unexpectedly: keeper bug (before that: refused) (3 failed attempts)\n\
+                 {REPORT_LOG_LINE} {LOG_DIR}",
                 path.display()
             )
         );
@@ -1117,7 +1131,7 @@ mod tests {
             failure,
             Some(KeeperFailure {
                 socket: path.clone(),
-                error: "its keeper stopped unexpectedly: keeper bug".into(),
+                error: "the dashboard's supervision of it stopped unexpectedly: keeper bug".into(),
                 failed_attempts: 0,
                 served: false,
                 logged: tracing::enabled!(tracing::Level::ERROR),

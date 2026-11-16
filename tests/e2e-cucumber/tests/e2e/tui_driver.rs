@@ -295,10 +295,17 @@ impl TuiSession {
         // Inherit the parent environment first, then overlay the isolation and
         // deterministic-terminal vars — mirroring how the piped `run_rocm` path
         // (`std::process::Command`, which inherits by default) resolves PATH and
-        // shared libraries, so the two spawn paths behave identically.
+        // shared libraries. One deliberate difference: this path drops the
+        // caller's `RUST_LOG`, which piped runs still inherit.
         for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
         }
+        // Steps read the client log and count the info-level lines `rocm`
+        // writes under its default filter, which a `RUST_LOG` in the shell
+        // running the suite would replace (e.g. `warn` drops every such line).
+        // Removed before the overlays below, so a scenario that sets its own
+        // filter still can.
+        cmd.env_remove("RUST_LOG");
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
             cmd.env(key, value);
         }

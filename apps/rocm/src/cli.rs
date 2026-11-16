@@ -713,8 +713,9 @@ rocm logs --search error timeout")]
     /// On Linux, open dashboards share one telemetry daemon; when the dashboard
     /// running it closes, one still open takes it over. If the daemon was
     /// failing when the dashboard closed, the reason is printed after it closes,
-    /// unless another dashboard's daemon is serving by then; a crash of the
-    /// dashboard's own daemon keeper is reported even then.
+    /// unless another dashboard's daemon is serving by then. If the dashboard's
+    /// own supervision of its telemetry daemon crashes, that is reported even
+    /// then.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]

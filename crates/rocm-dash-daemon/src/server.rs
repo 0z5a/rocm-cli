@@ -308,6 +308,12 @@ impl std::error::Error for SocketReplaced {}
 #[cfg(unix)]
 const STALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The most a probe reads while waiting for a greeting. A daemon's greeting is
+/// one short line; a listener that sends more without ending a line has
+/// answered all the same, and the probe stops reading there.
+#[cfg(unix)]
+const PROBE_GREETING_LIMIT: u64 = 4096;
+
 /// How often a serving daemon checks that its socket path still names the
 /// socket it bound.
 #[cfg(unix)]
@@ -346,19 +352,19 @@ fn probe_verdict(outcome: Option<std::io::Result<()>>) -> ProbeVerdict {
     }
 }
 
-/// Connect to an existing socket and, if it answers, read its first line
-/// before hanging up. A daemon greets every client at once, so leaving before
-/// the greeting would have it write to a closed connection and log an error
-/// for every probe.
+/// Connect to an existing socket and, if it answers, read its first line (at
+/// most [`PROBE_GREETING_LIMIT`] bytes of it) before hanging up. A daemon
+/// greets every client at once, so leaving before the greeting would have it
+/// write to a closed connection and log an error for every probe.
 #[cfg(unix)]
 async fn probe_socket(path: &std::path::Path) -> Option<std::io::Result<()>> {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
     tokio::time::timeout(STALE_PROBE_TIMEOUT, async {
         let stream = tokio::net::UnixStream::connect(path).await?;
         let mut greeting = Vec::new();
         // What it says, or whether it says anything, does not matter here.
-        let _ = BufReader::new(stream)
+        let _ = BufReader::new(stream.take(PROBE_GREETING_LIMIT))
             .read_until(b'\n', &mut greeting)
             .await;
         Ok(())
@@ -608,17 +614,16 @@ impl Drop for SocketClaim {
 #[cfg(unix)]
 const PATH_CHECK_UNKNOWN_LIMIT: u32 = 5;
 
-/// The unreadable path checks in a row after one more check, or `None` once
-/// they reach [`PATH_CHECK_UNKNOWN_LIMIT`]. A readable check starts over.
+/// The unreadable path checks in a row after one more `check`: a check that
+/// read the path (`Ok`) starts the count over at zero, and one that could not
+/// adds one. Once they reach [`PATH_CHECK_UNKNOWN_LIMIT`] it returns that
+/// last check's error instead.
 #[cfg(unix)]
-const fn unreadable_streak(streak: u32, readable: bool) -> Option<u32> {
-    if readable {
-        return Some(0);
-    }
-    if streak + 1 >= PATH_CHECK_UNKNOWN_LIMIT {
-        None
-    } else {
-        Some(streak + 1)
+fn unreadable_streak<E>(streak: u32, check: Result<(), E>) -> Result<u32, E> {
+    match check {
+        Ok(()) => Ok(0),
+        Err(e) if streak + 1 >= PATH_CHECK_UNKNOWN_LIMIT => Err(e),
+        Err(_) => Ok(streak + 1),
     }
 }
 
@@ -790,25 +795,23 @@ async fn serve_unix(
                 }
             }
             _ = path_check.tick() => {
-                let unreadable = match claim.path_state() {
-                    PathState::Ours => None,
+                let check = match claim.path_state() {
+                    PathState::Ours => Ok(()),
                     // Serving an inode nobody can reach would hold the lock,
                     // and so the path, forever.
                     PathState::Gone => return Err(SocketReplaced { path }.into()),
                     PathState::Unknown(e) => {
                         warn!(socket = %path.display(), error = %e, "could not check the socket path");
-                        Some(e)
+                        Err(e)
                     }
                 };
-                let readable = unreadable.is_none();
-                match (unreadable_streak(unknown_checks, readable), unreadable) {
-                    (Some(streak), _) => unknown_checks = streak,
-                    (None, e) => {
+                match unreadable_streak(unknown_checks, check) {
+                    Ok(streak) => unknown_checks = streak,
+                    Err(e) => {
                         return Err(anyhow!(
                             "checking socket {} failed {PATH_CHECK_UNKNOWN_LIMIT} times in a \
-                             row: {}",
+                             row: {e}",
                             path.display(),
-                            e.map_or_else(String::new, |e| e.to_string())
                         ));
                     }
                 }
@@ -1522,6 +1525,36 @@ mod tests {
             .expect("the greeting must reach a probe that is still connected");
     }
 
+    /// A listener that streams bytes and never ends a line still answers,
+    /// and the probe stops reading after a bounded greeting rather than
+    /// buffering whatever arrives until its timeout.
+    #[tokio::test]
+    async fn the_probe_reads_a_bounded_greeting_from_a_listener_that_never_ends_a_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let streamer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let chunk = [b'x'; 1024];
+            // Until the probe hangs up.
+            while stream.write_all(&chunk).await.is_ok() {}
+        });
+
+        let outcome = super::probe_socket(&path).await;
+
+        assert!(
+            matches!(outcome, Some(Ok(()))),
+            "the probe must finish reading before its timeout, got {outcome:?}"
+        );
+        assert!(matches!(probe_verdict(outcome), ProbeVerdict::Answered));
+        tokio::time::timeout(Duration::from_secs(5), streamer)
+            .await
+            .expect("the listener must see the probe hang up")
+            .unwrap();
+    }
+
     /// Losing the race to bind against a daemon without the lock is the same
     /// "in use" as finding it there, not a failure to report.
     #[tokio::test]
@@ -1883,27 +1916,34 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
     }
 
-    /// Unreadable path checks give the path up only five in a row; a check
-    /// that reads the path starts the count over.
+    /// Unreadable path checks give the path up only five in a row, with the
+    /// fifth check's error; a check that reads the path starts the count over.
     #[test]
     fn only_five_unreadable_path_checks_in_a_row_give_the_path_up() {
         use super::unreadable_streak;
 
         let mut streak = 0;
-        for _ in 0..4 {
-            streak = unreadable_streak(streak, false).expect("fewer than five");
+        for expected in 1..=4 {
+            streak = unreadable_streak(streak, Err("unreadable")).expect("fewer than five");
+            assert_eq!(streak, expected);
         }
-        assert_eq!(unreadable_streak(streak, false), None, "the fifth gives up");
         assert_eq!(
-            unreadable_streak(streak, true),
-            Some(0),
+            unreadable_streak(streak, Err("fifth")),
+            Err("fifth"),
+            "the fifth gives up with its error"
+        );
+        assert_eq!(
+            unreadable_streak::<&str>(streak, Ok(())),
+            Ok(0),
             "a good check resets"
         );
 
         let mut streak = 0;
         for readable in [false, false, false, false, true, false, false, false, false] {
-            streak = unreadable_streak(streak, readable).expect("never five in a row");
+            let check = if readable { Ok(()) } else { Err("unreadable") };
+            streak = unreadable_streak(streak, check).expect("never five in a row");
         }
+        assert_eq!(streak, 4);
     }
 
     // ── The socket directory (ROCMAI-456) ─────────────────────────────

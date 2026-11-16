@@ -298,9 +298,10 @@ twice, a known issue. If the daemon was failing when you quit the dashboard
 (it could not start, or stopped serving and had not recovered), and no other
 dashboard's daemon is serving by then, the dashboard says why after you quit
 it, however you opened it (`rocm dash`, interactive `rocm chat`, or the bare
-`rocm` launcher). A crash of the dashboard's own daemon keeper is reported
-even when another dashboard's daemon is serving. The dashboard presents five
-tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
+`rocm` launcher). If the dashboard's own supervision of its telemetry daemon
+crashes, that is reported even when another dashboard's daemon is serving. The
+dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys
+`1`–`5`):
 
 | Tab | What it shows |
 |---|---|

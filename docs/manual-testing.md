@@ -1368,8 +1368,8 @@ Expected result:
   stay behind: a daemon removes its socket only while it can still see it is
   its own). Do not run this as root, which `chmod 000` does not stop. Nothing is
   reported when, by the time the dashboard closes, another dashboard's daemon
-  serves the socket -- except a keeper that panicked, which is always
-  reported.
+  serves the socket -- except a crash of the dashboard's own supervision of
+  its telemetry daemon, which is always reported.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

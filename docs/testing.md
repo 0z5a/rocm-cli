@@ -4456,7 +4456,8 @@ a path that is not a socket (`a_path_that_is_not_a_socket_is_never_removed`),
 a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`),
 a bind lost to a daemon without the lock (`a_bind_lost_to_a_listener_without_the_lock_is_reported_in_use`),
 a busy or slow listener (`a_busy_or_slow_listener_counts_as_answering_not_stale`),
-a probe that stays for the greeting (`the_probe_waits_for_the_greeting_before_hanging_up`),
+a probe that stays for the greeting (`the_probe_waits_for_the_greeting_before_hanging_up`)
+and reads at most a bounded amount of it (`the_probe_reads_a_bounded_greeting_from_a_listener_that_never_ends_a_line`),
 a serving daemon whose socket is replaced (`a_daemon_whose_socket_is_replaced_gives_up_the_path`)
 or briefly cannot be checked (`a_daemon_keeps_serving_while_its_path_briefly_cannot_be_checked`)
 or stays unreadable (`a_daemon_gives_its_path_up_when_it_stays_unreadable`; run as root,
