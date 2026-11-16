@@ -1424,10 +1424,11 @@ man -w rocm
 ```
 
 Expected result: `man rocm` shows rocm's page, whose NAME section calls it
-the ROCm AI Command Center CLI, with a COMMANDS list matching `rocm --help`, and `man -w rocm` prints the
-path the installer reported (scenario `lifecycle-36`). If you set `MANPATH`
-yourself, it must end in `:` for this to work. A `rocm.1` you already had there
-is left as it is, and the installer prints `note: manual page not installed: …
+the ROCm AI Command Center CLI, with a COMMANDS list matching `rocm --help`,
+and `man -w rocm` prints the path the installer reported (scenario
+`lifecycle-36`). If you set `MANPATH` yourself, it must end in `:` for this to
+work. A `rocm.1` you already had there is left as it is, and the installer
+prints `note: manual page not installed: …
 already exists and was not written by this installer` (scenario
 `lifecycle-37`).
 

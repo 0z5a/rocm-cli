@@ -1920,9 +1920,18 @@ variables it reads are available offline:
 man rocm
 ```
 
-The page is made by the installed binary, so it matches it; run the installer
-again after building or upgrading by other means to refresh it. Each command's
-own options are in `rocm <command> --help`.
+The installer writes the page from the `rocm` it has just installed, so the two
+match, and an install or upgrade rewrites a page an earlier run wrote. It
+leaves alone a `rocm.1` it did not write, as described under Installation; it
+writes no page for a relative `ROCM_CLI_INSTALL_DIR`, and a download-only run
+(`ROCM_CLI_DOWNLOAD_ONLY`) installs nothing, page included. If the page cannot
+be made or written, the installer says so, and running it again tries again;
+when `rocm` could not make it, the page an earlier run wrote is left as it
+was. A run also replaces `rocm`
+and `rocmd` with the ones in the release archive it installs, so it cannot
+refresh the page for a `rocm` you built or copied in yourself; that page stays
+as the installer last wrote it. Each command's own options are in
+`rocm <command> --help`.
 
 ## Contributing
 

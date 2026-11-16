@@ -721,9 +721,10 @@ rocm logs --search error timeout")]
     /// binaries, including the running rocm.exe on Windows, and the fish
     /// completion script and manual page the Linux installer wrote for them
     /// (a rocm.fish or rocm.1 it did not write is left in place, and one it
-    /// cannot remove is only a warning). It also undoes the PATH change the installer made (its marked
-    /// shell-profile block, or the user PATH entry it recorded adding on
-    /// Windows), unless other programs share the install folder.
+    /// cannot remove is only a warning). It also undoes the PATH change the
+    /// installer made (its marked shell-profile block, or the user PATH entry
+    /// it recorded adding on Windows), unless other programs share the
+    /// install folder.
     #[command(after_help = "EXAMPLES:\n  \
 rocm uninstall --dry-run\n  \
 rocm uninstall\n  \

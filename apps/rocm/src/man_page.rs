@@ -25,6 +25,11 @@ use roff::{Roff, bold, italic, roman};
 /// One example invocation (the arguments after `rocm`) and what it does. A
 /// test parses every one through the real command line, so an example cannot
 /// name a command or flag that does not exist.
+///
+/// A description promises that something will not happen only where a test
+/// runs that example and checks the state afterwards; the comment beside it
+/// names the test. The other previews say what they show and leave their
+/// guarantees to the flag's own `--help`.
 const EXAMPLES: &[(&[&str], &str)] = &[
     (
         &["examine"],
@@ -32,7 +37,7 @@ const EXAMPLES: &[(&[&str], &str)] = &[
     ),
     (
         &["install", "sdk", "--dry-run"],
-        "Show which ROCm SDK would be installed, and where, without changing anything.",
+        "Show which ROCm SDK would be installed, and where.",
     ),
     (
         &["install", "sdk"],
@@ -40,7 +45,7 @@ const EXAMPLES: &[(&[&str], &str)] = &[
     ),
     (
         &["install", "driver", "--dry-run"],
-        "Show what installing AMD driver support would do, without changing anything.",
+        "Show what installing AMD driver support would do.",
     ),
     (
         &["runtimes", "list"],
@@ -48,7 +53,7 @@ const EXAMPLES: &[(&[&str], &str)] = &[
     ),
     (
         &["update", "--dry-run"],
-        "Show what installing a newer ROCm build would do, without changing anything.",
+        "Show what installing a newer ROCm build would do.",
     ),
     (
         &["diagnose"],
@@ -68,9 +73,12 @@ const EXAMPLES: &[(&[&str], &str)] = &[
     ),
     (
         &["daemon", "--status"],
-        "Print the status of the automation watchers once, without starting the background \
-         supervisor.",
+        "Print the status of the automation watchers once.",
     ),
+    // Proved by lifecycle-36 (`install_lifecycle.feature`), which runs this
+    // example as written on an installed rocm and checks that the binaries
+    // and the manual page are still there and nothing is reported removed,
+    // before the real uninstall removes them.
     (
         &["uninstall", "--dry-run"],
         "Show what rocm uninstall would remove, without removing anything.",
@@ -308,10 +316,12 @@ fn exit_status_section() -> Roff {
         "The command line could not be parsed, such as an unknown option or a missing or \
          invalid argument.",
     )]);
+    // Every code `rocm fix` publishes beyond 0 and 1, including one equal to
+    // the usage code above: `rocm fix` exits 2 for an unknown fix id too.
     let others: Vec<String> = rocm_core::catalog_manifest()
         .exit_codes
         .into_iter()
-        .filter(|(_, code)| ![0, 1, usage].contains(code))
+        .filter(|(_, code)| ![0, 1].contains(code))
         .map(|(name, code)| (code, name))
         .collect::<std::collections::BTreeMap<_, _>>()
         .into_iter()
@@ -367,16 +377,37 @@ mod tests {
             .collect()
     }
 
+    /// `line` as a reader sees it: font changes dropped, `\-` a hyphen and
+    /// `\*(Aq` an apostrophe.
+    fn decode(line: &str) -> String {
+        line.replace("\\fB", "")
+            .replace("\\fI", "")
+            .replace("\\fR", "")
+            .replace("\\-", "-")
+            .replace("\\*(Aq", "'")
+    }
+
     /// The term of every `.TP` entry in `lines`.
     fn terms(lines: &[String]) -> Vec<String> {
+        entries(lines).into_iter().map(|(term, _)| term).collect()
+    }
+
+    /// The decoded term and description of every `.TP` entry in `lines`; an
+    /// entry with no description line gets an empty one.
+    fn entries(lines: &[String]) -> Vec<(String, String)> {
         lines
-            .windows(2)
-            .filter(|pair| pair[0] == ".TP")
-            .map(|pair| {
-                pair[1]
-                    .replace("\\fB", "")
-                    .replace("\\fR", "")
-                    .replace("\\-", "-")
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| *line == ".TP")
+            .map(|(at, _)| {
+                let line = |offset: usize| {
+                    lines
+                        .get(at + offset)
+                        .filter(|line| !line.starts_with('.'))
+                        .map(|line| decode(line))
+                        .unwrap_or_default()
+                };
+                (line(1), line(2))
             })
             .collect()
     }
@@ -395,6 +426,34 @@ mod tests {
         let listed = terms(&section(&page(), "COMMANDS"));
         assert_eq!(listed, visible);
         assert!(!listed.iter().any(|name| name == "__man-page"));
+    }
+
+    /// Each COMMANDS entry is described by the summary `rocm --help` prints
+    /// beside that command, `[preview]` marker included.
+    #[test]
+    fn each_command_is_described_by_its_help_summary() {
+        let root = crate::Cli::command();
+        let mut expected: Vec<(String, String)> = root
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| {
+                let about = sc.get_about().map(ToString::to_string).unwrap_or_default();
+                (sc.get_name().to_owned(), about)
+            })
+            .collect();
+        expected.sort();
+        let listed = entries(&section(&page(), "COMMANDS"));
+        assert_eq!(listed, expected);
+        assert!(
+            listed
+                .iter()
+                .any(|(_, what)| what.starts_with("[preview] ")),
+            "no command carries the [preview] marker: {listed:?}"
+        );
+        assert!(
+            listed.iter().all(|(_, what)| !what.is_empty()),
+            "a command has no description: {listed:?}"
+        );
     }
 
     /// Every example is a command line `rocm` accepts.
@@ -451,10 +510,12 @@ mod tests {
         }
     }
 
-    /// The usage-error code is the one clap exits with, and `rocm fix`'s own
-    /// codes are the ones it publishes.
+    /// The usage-error code is the one clap exits with, and the sentence on
+    /// `rocm fix` gives every code beyond 0 and 1 that it publishes, including
+    /// the unknown-id code that equals the usage code.
     #[test]
     fn the_exit_status_section_names_the_codes_rocm_exits_with() {
+        use rocm_core::fix::exit;
         let clap_code = crate::cli_command()
             .try_get_matches_from(["rocm", "examine", "--bogus"])
             .expect_err("an unknown flag is refused")
@@ -462,14 +523,32 @@ mod tests {
         let lines = section(&page(), "EXIT STATUS");
         let codes = terms(&lines);
         assert_eq!(codes, ["0", "1", &clap_code.to_string()], "{lines:?}");
-        let text = lines.join("\n");
+        let fix_codes = [
+            (exit::UNKNOWN_ID, "unknown_id"),
+            (exit::NOT_APPLICABLE, "not_applicable"),
+            (exit::FAILED, "failed"),
+            (exit::DECLINED, "declined"),
+        ];
+        let listed: Vec<String> = fix_codes
+            .iter()
+            .map(|(code, name)| format!("{code} ({name})"))
+            .collect();
+        let expected = format!(
+            "rocm fix also exits {}; rocm fix --json lists every code it uses under exit_codes.",
+            listed.join(", ")
+        );
+        assert!(
+            lines.iter().any(|line| decode(line) == expected),
+            "no line reads {expected:?}: {lines:?}"
+        );
+        // A code `rocm fix` starts publishing must be added above, so the
+        // sentence cannot silently stop covering every code.
         for (name, code) in rocm_core::catalog_manifest().exit_codes {
-            if ![0, 1, clap_code].contains(&code) {
-                assert!(
-                    text.contains(&format!("{code} ({name})")),
-                    "{name} missing: {text}"
-                );
-            }
+            assert!(
+                [exit::OK, exit::INTERNAL].contains(&code)
+                    || fix_codes.contains(&(code, name.as_str())),
+                "{name} ({code}) is published but not checked here"
+            );
         }
     }
 

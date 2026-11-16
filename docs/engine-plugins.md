@@ -160,10 +160,11 @@ Installer policy:
   with a roff comment line naming the install folder, and records it as a
   `man` line in `.rocm-cli-path-edit`, so `rocm uninstall` removes it with the
   binaries. It does so even with `ROCM_CLI_UPDATE_SHELL_PATH=0`, since it is
-  no `PATH` change. As for `rocm.fish`, the installer leaves an existing
-  `rocm.1` (or link) that does not start with that line as it is, and
-  uninstall leaves a recorded `rocm.1` that does not start with that line for
-  its own folder.
+  no `PATH` change. As for `rocm.fish`, the installer leaves as it is an
+  existing `rocm.1` that is a link, or that does not start with that comment
+  line naming some install folder, and replaces one that names any install
+  folder; uninstall leaves a recorded `rocm.1` that does not start with that
+  line naming its own install folder.
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use

@@ -7,10 +7,10 @@
 //!
 //! The steps read the roff source directly, not `man`'s rendering of it, so the
 //! scenarios need nothing on the runner beyond the binary: an entry's term is
-//! the line after its `.TP` request, with roff's font and character escapes
-//! decoded. An escape the decoder does not know fails the step rather than
-//! being passed through, so a change in how the page is written is noticed
-//! instead of silently mangling a term. That the installed page is found and
+//! the line after its `.TP` request and its description the line after that,
+//! with roff's font and character escapes decoded. An escape the decoder does
+//! not know fails the step rather than being passed through, so a change in how
+//! the page is written is noticed instead of silently mangling a term. That the installed page is found and
 //! shown by `man rocm` is lifecycle-36, on the lane that installs it.
 
 use cucumber::{then, when};
@@ -50,6 +50,15 @@ fn decode_roff(text: &str) -> String {
 
 /// The decoded term of every `.TP` entry in the section headed `name`.
 fn section_terms(roff: &str, name: &str) -> Vec<String> {
+    section_entries(roff, name)
+        .into_iter()
+        .map(|(term, _)| term)
+        .collect()
+}
+
+/// The decoded term and description of every `.TP` entry in the section
+/// headed `name`; an entry with no description line gets an empty one.
+fn section_entries(roff: &str, name: &str) -> Vec<(String, String)> {
     let heading = format!(".SH {name}");
     let heading_quoted = format!(".SH \"{name}\"");
     let mut lines = roff
@@ -60,25 +69,37 @@ fn section_terms(roff: &str, name: &str) -> Vec<String> {
         "no section {name} in the page:\n{roff}"
     );
     let body: Vec<&str> = lines.take_while(|line| !line.starts_with(".SH ")).collect();
-    body.windows(2)
-        .filter(|pair| pair[0] == ".TP")
-        .map(|pair| decode_roff(pair[1]).trim().to_owned())
+    let line = |at: usize| {
+        body.get(at)
+            .filter(|line| !line.starts_with('.'))
+            .map(|line| decode_roff(line).trim().to_owned())
+            .unwrap_or_default()
+    };
+    body.iter()
+        .enumerate()
+        .filter(|(_, line)| **line == ".TP")
+        .map(|(at, _)| (line(at + 1), line(at + 2)))
         .collect()
 }
 
-/// The commands `rocm --help` lists, without clap's own `help`.
-fn help_commands(help: &str) -> Vec<String> {
-    let mut names: Vec<String> = help
+/// The commands `rocm --help` lists, each with the summary printed beside it,
+/// without clap's own `help`. Each command takes one line, since rocm builds
+/// clap without its `wrap_help` feature; a continuation line would show up
+/// here as a command named after its first word, and fail the comparison.
+fn help_commands(help: &str) -> Vec<(String, String)> {
+    let mut commands: Vec<(String, String)> = help
         .lines()
         .skip_while(|line| !line.trim_start().starts_with("Commands:"))
         .skip(1)
         .take_while(|line| !line.trim().is_empty())
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|name| *name != "help")
-        .map(str::to_owned)
+        .filter_map(|line| {
+            let line = line.trim();
+            let (name, about) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+            (name != "help").then(|| (name.to_owned(), about.trim().to_owned()))
+        })
         .collect();
-    names.sort();
-    names
+    commands.sort();
+    commands
 }
 
 #[when("the user reads the rocm manual page")]
@@ -94,7 +115,9 @@ async fn when_user_reads_manual(world: &mut E2eWorld) {
 #[then("the manual describes every command the help lists, and none it hides")]
 async fn then_manual_lists_help_commands(world: &mut E2eWorld) {
     let roff = world.cli_output.clone().expect("the manual was not read");
-    let mut listed = section_terms(&roff, "COMMANDS");
+    // Each entry with its description, so a page that listed the right names
+    // but dropped or garbled the summaries (or the `[preview]` marker) differs.
+    let mut listed = section_entries(&roff, "COMMANDS");
     listed.sort();
     let help = run_rocm_ok(world, &["--help"]);
     let visible = help_commands(&help);

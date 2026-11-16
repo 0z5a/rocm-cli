@@ -3402,22 +3402,27 @@ signs a local bundle, points the installer at a temporary home, and checks:
   and only the install folder and the system folders on `PATH` finds it there
   (man-db derives `<dir>/../share/man` from each `PATH` folder), and the
   script prints `not checked` otherwise;
-- a reinstall replaces its own page and adds no second `man` record line, and
-  one an earlier install folder wrote is replaced and recorded;
+- a reinstall replaces its own page, adds no second `man` record line and,
+  with the profile already configured, still suggests `man rocm`, and a page
+  an earlier install folder wrote is replaced and recorded;
 - a `rocm.1` that is already there and was not written by the installer (a
   file, a link, a link whose target carries the marker, a dangling link) is
   left exactly as it is, not recorded, with a note;
 - `ROCM_CLI_UPDATE_SHELL_PATH=0` still installs and records the page, without
   the `man rocm` hint, and a relative install folder skips it with a note;
 - a `rocm` that cannot print the page, or prints nothing, leaves the install
-  in place with a note and no page or record line, and the printed lines, run
-  as printed from a bare environment in a home whose name holds a space and a
-  quote, write the page the installer would have, marker included, so the
-  next install takes it as its own and records it;
+  in place with a note that running the installer again tries again, no
+  command to run, no `rocm.1` or other file in `man1`, no record line and no
+  `man rocm` hint. The stub fails only once, and running the installer again
+  then installs and records the page. On a reinstall the same failure leaves
+  the page the earlier run installed byte for byte, with its record line;
+- a page that cannot be written, because a file stands where the folder
+  above `man1` has to go, leaves the install with the same note, no record
+  line and no `man rocm` hint;
 - a `rocm` that prints something other than a page and exits 0, as one built
   before `__man-page` existed prints a request plan, gets a note that this
-  version of rocm does not provide a page, with no page, record line, retry
-  lines or `man rocm` hint;
+  version of rocm does not provide a page, with no page, record line, note to
+  run the installer again or `man rocm` hint;
 - a profile that cannot be created still gets the page, but not the
   `man rocm` hint, since a new terminal would not have the install folder on
   `PATH` for `man` to find it.
@@ -3451,18 +3456,20 @@ The installed manual page has three scenarios of its own.
 the installer reports the page and suggests `man rocm`, that `man rocm` and
 `man -w rocm`, run with `MANPATH` unset and `PATH` holding only the install
 folder and `/usr/bin:/bin`, show the installed rocm's page from
-`<install folder>/../share/man/man1`, and that uninstall removes it with its
-record. `@id:lifecycle-linux-man-page-not-ours-left-alone` (lifecycle-37)
+`<install folder>/../share/man/man1`, that `rocm uninstall --dry-run` lists
+it as a `manual page` and leaves it and the binaries, and that uninstall then removes it with
+its record. `@id:lifecycle-linux-man-page-not-ours-left-alone` (lifecycle-37)
 checks that a `rocm.1` the user already had is left alone, with the
-installer's note, and that uninstall leaves it too.
+installer's note and no record line, and that uninstall leaves it too; with
+nothing recorded, that last half holds by construction.
 `@id:lifecycle-linux-man-page-replaced-kept` (lifecycle-38) checks that
 uninstall leaves a recorded `rocm.1` the user wrote over the installer's, and
 says why. lifecycle-36 needs `man`
 (man-db) on the runner, and relies on man-db finding pages through `PATH`; it
 fails, rather than skips, without it, which is why the `build-and-test` job that
 runs the Linux lifecycle scenarios installs `man-db`. lifecycle-37 and
-lifecycle-38 read only files and run no `man`. The page's content against the binary is
-`manual-page-01` and `manual-page-02` below.
+lifecycle-38 read only files and run no `man`. The page's content against the
+binary is `manual-page-01` and `manual-page-02` below.
 
 The `windows-release` job of the required `windows-build-and-test` lane
 additionally folds in the hermetic `comfyui-01`/`comfyui-02`/`comfyui-03`
@@ -3498,8 +3505,9 @@ Linux writes the shell profile); reinstall stale-manifest purge and config
 preservation; a Windows loopback-HTTP install; isolated installed-binary
 directory smoke checks (`rocm examine` must read only the isolated
 config/data/cache, never the real user `.rocm` state); and uninstall: a full
-purge that also restores the shell profile and removes the manual page, the Windows user `PATH` taken back
-off with its other entries and its registry type kept, the `PATH` change kept while another program shares the install folder or
+purge that also restores the shell profile and removes the manual page, the
+Windows user `PATH` taken back off with its other entries and its registry type
+kept, the `PATH` change kept while another program shares the install folder or
 with `--keep-binaries`, a `PATH` change that cannot be undone removing nothing
 so it can be retried, a profile and install-folder spelling found only through
 the installer's record, and the running Windows `rocm.exe` removed. The two
@@ -3700,20 +3708,25 @@ for live ROCm GPU acceptance.
 
 `rocm __man-page`, the hidden verb the Linux installer runs, prints the rocm(1)
 page as roff. The unit tests in [man_page.rs](../apps/rocm/src/man_page.rs)
-check the roff: the COMMANDS list is the visible top-level commands, every
-example parses, the exit codes are the ones clap and `rocm fix` use, and no
-other `rocm-*` page is referred to. The `manual-page-NN` E2E scenarios
-([manual_page.feature](../tests/e2e-cucumber/features/manual_page.feature), Linux only, default mock lane) read the page
-the binary under test prints, from its roff source: each entry's term is the
-line after its `.TP`, with roff's font and character escapes decoded, and an
+check the roff: the COMMANDS list is the visible top-level commands, each
+described by its `--help` summary with any `[preview]` marker, every example
+parses, the exit codes are the ones clap and `rocm fix` use (`rocm fix`'s
+`unknown_id`, which shares clap's usage code, included), and no other
+`rocm-*` page is referred to. The `manual-page-NN` E2E scenarios
+([manual_page.feature](../tests/e2e-cucumber/features/manual_page.feature),
+Linux only, default mock lane) read the page the binary under test prints,
+from its roff source: each entry's term is the line after its `.TP` and its
+description the line after that, with roff's font and character escapes
+decoded, and an
 escape the step does not know fails it rather than passing through. They need
 nothing on the runner but the binary, so they run on every Linux lane,
 self-hosted ones included, whether or not it has `man`:
 
 - `@id:manual-page-lists-the-commands` (manual-page-01) compares the commands
-  the page lists with the ones `rocm --help` lists, without clap's
-  `help`, so a command added to the CLI cannot be missing from the page and a
-  hidden one cannot appear on it;
+  the page lists, each with its description, with the ones `rocm --help`
+  lists and the summary beside each, without clap's `help`, so a command added
+  to the CLI cannot be missing from the page, a hidden one cannot appear on
+  it, and a summary cannot be dropped or differ;
 - `@id:manual-page-examples-are-accepted` (manual-page-02) runs every example
   the page gives with `--help` appended and expects exit 0, so an
   example naming a command or flag that does not exist fails.

@@ -1185,6 +1185,11 @@ async fn when_uninstall_keep(world: &mut E2eWorld) {
     run_uninstall(world, &["--keep-config", "--keep-data", "--keep-cache"]);
 }
 
+#[when("the user previews the uninstall from the installed binary")]
+async fn when_uninstall_dry_run(world: &mut E2eWorld) {
+    run_uninstall(world, &["--dry-run"]);
+}
+
 #[when("the user uninstalls from the installed binary keeping the binaries")]
 async fn when_uninstall_keep_binaries(world: &mut E2eWorld) {
     run_uninstall(world, &["--keep-binaries"]);
@@ -2027,6 +2032,37 @@ async fn then_man_page_gone(world: &mut E2eWorld) {
         out.contains(&format!("removed manual page {}", path.display())),
         "uninstall did not report removing the manual page:\n{out}"
     );
+}
+
+#[then("the uninstall preview lists the manual page and leaves it and the binaries in place")]
+async fn then_uninstall_preview_lists_man_page(world: &mut E2eWorld) {
+    let st = state(world);
+    let path = man_page(st);
+    let out = &st.last_output;
+    assert_eq!(st.last_rc, 0, "the uninstall preview failed:\n{out}");
+    assert!(
+        out.contains(&format!("  - manual page: {}", path.display())),
+        "the uninstall preview did not list the manual page:\n{out}"
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains(".TH ROCM 1"),
+        "the uninstall preview removed {}",
+        path.display()
+    );
+    assert!(
+        !out.contains("removed "),
+        "the uninstall preview reported removing something:\n{out}"
+    );
+    for name in ["rocm", "rocmd"] {
+        let binary = installed_binary(&st.install_dir, name);
+        assert!(
+            binary.exists(),
+            "the uninstall preview removed {}",
+            binary.display()
+        );
+    }
 }
 
 #[then("the rocm manual page is still in place")]

@@ -81,6 +81,10 @@ pub(crate) struct UninstallPlan {
     /// The installer's record of its PATH change, removed once that change is
     /// undone.
     pub(crate) path_record: Option<PathBuf>,
+    /// The install folder whose marker each planned fish completion script or
+    /// manual page carried when it was planned, checked again just before the
+    /// file is removed.
+    pub(crate) installer_files_owner: Option<PathBuf>,
     /// The running executable, on Windows, which is deleted as the command exits.
     pub(crate) self_delete: Option<PathBuf>,
 }

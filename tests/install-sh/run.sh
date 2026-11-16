@@ -342,6 +342,9 @@ failures_before="${FAILURES}"
 assert_file_eq "manual page after reinstall" "${bash_man}" "$(installed_man_page "${bash_home}")"
 assert_eq "recorded manual page lines" "$(man_record_count "${bash_home}")" 1
 assert_log_contains "${WORK}/bash-fish-again.log" "manual page installed:" "reinstall did not replace its own manual page"
+# The reinstall finds the profile already configured, and that still counts as
+# saved: a new terminal has the install folder on PATH, so man finds the page.
+assert_log_contains "${WORK}/bash-fish-again.log" "read the manual, offline" "reinstall with the profile already configured did not suggest man rocm"
 if [ "${FAILURES}" -eq "${failures_before}" ]; then
   pass "reinstall replaces its own manual page and records it once"
 fi
@@ -590,13 +593,14 @@ if [ "${FAILURES}" -eq 0 ]; then
 fi
 
 # A rocm that cannot print its manual page, or prints nothing, still installs
-# cleanly and writes and records no page. The printed advice, run as printed
-# from a bare environment in a home whose name holds a space and a quote,
-# writes the page the installer would have, marker included, so the next
-# install takes it as its own and records it.
+# cleanly, writes and records no page, and says so with a note that running
+# the installer again tries again, and no `man rocm` hint. The stub fails only
+# once, so running the installer again, as the note says, installs the page and
+# records it. A failure on a reinstall leaves the page the earlier run
+# installed exactly as it was, with its record line.
 failures_before="${FAILURES}"
 for mode in fail-once empty-once; do
-  mp_home="${WORK}/homes/spaced it's man ${mode}"
+  mp_home="${WORK}/homes/man-page-${mode}"
   mp_log="${WORK}/man-page-${mode}.log"
   mp_path="$(man_page_path "${mp_home}")"
   mkdir -p "${mp_home}"
@@ -607,25 +611,58 @@ for mode in fail-once empty-once; do
   [ -x "${mp_home}/.local/bin/rocm" ] || fail "manual page (${mode}) stopped the install"
   assert_contains "${mp_home}/.bashrc" "${POSIX_SNIPPET}" "manual page (${mode}) lost the PATH block"
   assert_log_contains "${mp_log}" "note: could not install the manual page" "manual page (${mode}) did not print the note"
+  assert_log_contains "${mp_log}" "run the installer again to try again" "manual page (${mode}) did not say to run the installer again"
   assert_log_lacks "${mp_log}" "manual page installed:" "manual page (${mode}) was reported installed"
   assert_log_lacks "${mp_log}" "man rocm" "manual page (${mode}) suggested man rocm"
+  assert_log_lacks "${mp_log}" "__man-page" "manual page (${mode}) printed a command to run"
   assert_eq "manual page (${mode}) record lines" "$(man_record_count "${mp_home}")" 0
-  assert_log_contains "${mp_log}" "to try again, run the installer again, or run:" "manual page (${mode}) did not offer to run the installer again"
-  # The three command lines after the manual page note's "to try again".
-  advice="$(awk '/note: could not install the manual page/ { found = 1 } found && /to try again/ { n = 3; found = 0; next } n > 0 { sub(/^  /, ""); print; n-- }' "${mp_log}")"
-  if [ -z "${advice}" ]; then
-    fail "manual page (${mode}) printed no advice"
-  elif ! env -i HOME="${mp_home}" PATH="${TOOLS}" \
-    "${TOOLS}/sh" -c "${advice}" < /dev/null; then
-    fail "manual page (${mode}) advice did not run"
+  if find "$(dirname -- "${mp_path}")" -mindepth 1 2>/dev/null | grep -q .; then
+    fail "manual page (${mode}) left files in $(dirname -- "${mp_path}")"
   fi
-  assert_file_eq "manual page (${mode}) after the advice" "${mp_path}" "$(installed_man_page "${mp_home}")"
+  # Running the installer again, as the note says, installs the page.
   install_case "${mp_log}.again" "${mp_home}" /bin/bash "${BASE_PATH}" 1
-  assert_log_contains "${mp_log}.again" "manual page installed:" "manual page (${mode}) written by the advice was not taken as the installer's"
-  assert_eq "manual page (${mode}) record lines after reinstall" "$(man_record_count "${mp_home}")" 1
+  assert_log_contains "${mp_log}.again" "manual page installed:" "manual page (${mode}) was not installed by running the installer again"
+  assert_file_eq "manual page (${mode}) after running the installer again" "${mp_path}" "$(installed_man_page "${mp_home}")"
+  assert_eq "manual page (${mode}) record lines after running the installer again" "$(man_record_count "${mp_home}")" 1
+  # A reinstall whose rocm cannot print the page leaves the installed one.
+  # The line added here would be gone if the reinstall wrote the page again.
+  printf '%s\n' 'a page an earlier run installed' >> "${mp_path}"
+  cp "${mp_path}" "${WORK}/man-page-${mode}.before"
+  printf '%s\n' "${mode}" > "${mp_home}/.stub-man-page"
+  install_case "${mp_log}.reinstall" "${mp_home}" /bin/bash "${BASE_PATH}" 1
+  assert_absent_file "${mp_home}/.stub-man-page" "manual page (${mode}) reinstall was never attempted"
+  cmp -s "${mp_path}" "${WORK}/man-page-${mode}.before" \
+    || fail "manual page (${mode}) changed by a reinstall that could not print it"
+  assert_eq "manual page (${mode}) record lines after a reinstall that could not print it" "$(man_record_count "${mp_home}")" 1
+  assert_log_contains "${mp_log}.reinstall" "note: could not install the manual page" "manual page (${mode}) reinstall did not print the note"
+  assert_log_contains "${mp_log}.reinstall" "run the installer again to try again" "manual page (${mode}) reinstall did not say to run the installer again"
+  assert_log_lacks "${mp_log}.reinstall" "manual page installed:" "manual page (${mode}) reinstall was reported installed"
+  assert_log_lacks "${mp_log}.reinstall" "man rocm" "manual page (${mode}) reinstall suggested man rocm"
 done
 if [ "${FAILURES}" -eq "${failures_before}" ]; then
-  pass "a manual page that cannot be generated leaves the install and a working hint"
+  pass "a manual page that cannot be generated is not installed, and running the installer again installs it"
+fi
+
+# A page that rocm printed but that cannot be written, here because a regular
+# file stands where the folder above man1 has to go, leaves the install and the
+# note, and nothing on record and no `man rocm` hint.
+failures_before="${FAILURES}"
+wf_home="${WORK}/homes/unwritable-man"
+wf_log="${WORK}/unwritable-man.log"
+mkdir -p "${wf_home}/.local"
+printf '%s\n' 'not a folder' > "${wf_home}/.local/share"
+install_case "${wf_log}" "${wf_home}" /bin/bash "${BASE_PATH}" 1
+assert_file_eq "the file in place of share" "${wf_home}/.local/share" 'not a folder'
+[ -x "${wf_home}/.local/bin/rocm" ] || fail "an unwritable manual page folder stopped the install"
+assert_contains "${wf_home}/.bashrc" "${POSIX_SNIPPET}" "an unwritable manual page folder lost the PATH block"
+assert_log_contains "${wf_log}" "note: could not install the manual page" "an unwritable manual page folder did not print the note"
+assert_log_contains "${wf_log}" "run the installer again to try again" "an unwritable manual page folder did not say to run the installer again"
+assert_log_lacks "${wf_log}" "__man-page" "an unwritable manual page folder printed a command to run"
+assert_log_lacks "${wf_log}" "manual page installed:" "an unwritable manual page folder was reported installed"
+assert_log_lacks "${wf_log}" "man rocm" "an unwritable manual page folder suggested man rocm"
+assert_eq "unwritable manual page folder record lines" "$(man_record_count "${wf_home}")" 0
+if [ "${FAILURES}" -eq "${failures_before}" ]; then
+  pass "a manual page that cannot be written leaves the install, the note and no record"
 fi
 
 # A rocm too old to have `__man-page` prints a request plan and exits 0. That
@@ -645,7 +682,7 @@ assert_contains "${op_home}/.bashrc" "${POSIX_SNIPPET}" "an old rocm's request p
 assert_log_contains "${op_log}" "note: manual page not installed: this version of rocm does not provide one" "an old rocm's request plan was not reported"
 assert_log_lacks "${op_log}" "manual page installed:" "an old rocm's request plan was reported installed"
 assert_log_lacks "${op_log}" "could not install the manual page" "an old rocm's request plan got the retry note"
-assert_log_lacks "${op_log}" "__man-page >>" "an old rocm's request plan got a retry recipe"
+assert_log_lacks "${op_log}" "run the installer again to try again" "an old rocm's request plan was told to run the installer again"
 assert_log_lacks "${op_log}" "man rocm" "an old rocm's request plan suggested man rocm"
 assert_eq "old rocm manual page record lines" "$(man_record_count "${op_home}")" 0
 if [ "${FAILURES}" -eq "${failures_before}" ]; then

@@ -227,6 +227,7 @@ need_cmd install
 need_cmd rm
 need_cmd grep
 need_cmd sed
+need_cmd dirname
 
 shell_name() {
   if [ -n "${ROCM_CLI_SHELL_NAME:-}" ]; then
@@ -539,14 +540,11 @@ install_man_page() {
     ok "manual page installed:"
     info "${man_path}"
   else
-    # Run as printed, these lines write the page as the installer would,
-    # marker included, so the next install or uninstall treats it as its own.
+    # The page was not installed or recorded. When rocm could not print it,
+    # nothing was written, so a rocm.1 an earlier run installed stays as it
+    # was, with its record line. Running the installer again tries again.
     info "note: could not install the manual page"
-    info "to try again, run the installer again, or run:"
-    info "mkdir -p $(sh_quote "${man_dir}")"
-    info "printf '%s%s\\n' $(sh_quote "${MAN_PAGE_MARKER}") $(sh_quote "${INSTALL_DIR}") > $(sh_quote "${man_path}")"
-    info "$(sh_quote "${INSTALL_DIR}/rocm") __man-page >> $(sh_quote "${man_path}")"
-    info "(rocm uninstall removes a page written that way only after the installer runs again and records it)"
+    info "run the installer again to try again"
   fi
 }
 

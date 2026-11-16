@@ -474,7 +474,9 @@ Feature: Release install lifecycle
   # The manual page lands in share/man/man1 under the folder above the install
   # directory, where man-db looks for the pages of any folder on PATH. The
   # lookup runs with MANPATH unset and PATH holding only the install directory
-  # and the system folders, as in a new terminal after the install.
+  # and the system folders, as in a new terminal after the install. A dry run
+  # of the uninstall lists the page and leaves it and the binaries; the real
+  # one removes them.
   @id:lifecycle-linux-man-page-installed-and-removed @lifecycle @requires-os:linux
   Scenario: lifecycle-36 - Linux - man rocm shows the installed rocm's manual, and uninstall removes it
     Given a freshly built release tree
@@ -482,11 +484,17 @@ Feature: Release install lifecycle
     And a signed bundle installed with the shell profile updated
     Then the installer reports the manual page and suggests man rocm
     And man rocm in a new terminal shows the installed rocm's manual
+    When the user previews the uninstall from the installed binary
+    Then the uninstall preview lists the manual page and leaves it and the binaries in place
     When the user uninstalls from the installed binary
     Then the installed rocm and rocmd binaries are gone
     And the rocm manual page is gone
     And the record of the installer's PATH change is gone
 
+  # The installer records nothing for a page it did not write, which the first
+  # Then checks, so uninstall never looks at this page and its half holds by
+  # construction; it is the end-to-end backstop. A recorded page the user wrote
+  # over, which uninstall has to read to leave, is lifecycle-38.
   @id:lifecycle-linux-man-page-not-ours-left-alone @lifecycle @requires-os:linux
   Scenario: lifecycle-37 - Linux - the installer leaves a rocm manual page it did not write, says so, and uninstall leaves it too
     Given a freshly built release tree

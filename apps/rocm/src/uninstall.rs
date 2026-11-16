@@ -118,6 +118,17 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
 /// A fish completion script or manual page that cannot be removed is reported
 /// as a warning and the rest goes on.
 fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<()> {
+    execute_plan_with(plan, report, installer_marker_owner)
+}
+
+/// [`execute_plan`] with the reading of an installer file's marker line
+/// supplied, so a file that cannot be read again is testable without relying
+/// on file permissions, which root ignores.
+fn execute_plan_with(
+    plan: &UninstallPlan,
+    report: &mut dyn FnMut(String),
+    read_owner: impl Fn(&Path, &[u8]) -> std::io::Result<Option<PathBuf>>,
+) -> Result<()> {
     for edit in &plan.path_edits {
         match apply_path_edit(edit) {
             Ok(line) => report(line),
@@ -135,12 +146,24 @@ fn execute_plan(plan: &UninstallPlan, report: &mut dyn FnMut(String)) -> Result<
     for entry in non_binaries.chain(binaries) {
         let installer_file = installer_file(entry.kind);
         // The review may have sat at a prompt, so a completion script or
-        // manual page is looked at again: only the regular file that was
-        // planned is removed.
-        if installer_file.is_some() && is_not_a_regular_file(&entry.path) {
+        // manual page is checked again just before it goes, as it was when
+        // planned: one that is no longer a regular file starting with this
+        // install's marker is left in place.
+        let changed = installer_file.and_then(|file| {
+            match plan.installer_files_owner.as_deref() {
+                Some(owner) => changed_since_review(&entry.path, file, owner, &read_owner),
+                // Only planning that checked the file's marker sets the
+                // owner, so without one the file was never checked.
+                None => Some(
+                    "no install folder was checked against its marker when the uninstall was \
+                     planned"
+                        .to_owned(),
+                ),
+            }
+        });
+        if let Some(why) = changed {
             report(format!(
-                "warning: left {} {} in place: it is no longer the regular file that was \
-                 reviewed",
+                "warning: left {} {} in place: {why}",
                 entry.kind,
                 entry.path.display()
             ));
@@ -516,6 +539,7 @@ fn plan_installer_file_removals_with(
         }
         match read_owner(&path, file.marker) {
             Ok(Some(owner)) if same_folder(&owner, bin_dir) => {
+                plan.installer_files_owner = Some(bin_dir.to_path_buf());
                 plan.actions.push(UninstallPlanEntry {
                     kind: file.plan_kind,
                     path,
@@ -546,11 +570,36 @@ fn plan_installer_file_removals_with(
     unchecked
 }
 
-/// Whether `path` is now something other than a regular file, such as a link
-/// or a folder. A path that is gone, or that cannot be looked at, is not: the
-/// removal that follows then reports that itself.
-fn is_not_a_regular_file(path: &Path) -> bool {
-    matches!(fs::symlink_metadata(path), Ok(meta) if !meta.is_file())
+/// Why the installer file planned at `path` is no longer the one the review
+/// listed, if it is not: it became a link or a folder, or a regular file whose
+/// first line, read with `read_owner`, is not `file`'s marker naming `owner`,
+/// the folder it named when planned, or cannot be read. A path that is gone,
+/// or that cannot be looked at, is still the planned one: the removal that
+/// follows then reports that itself.
+fn changed_since_review(
+    path: &Path,
+    file: &InstallerFile,
+    owner: &Path,
+    read_owner: impl Fn(&Path, &[u8]) -> std::io::Result<Option<PathBuf>>,
+) -> Option<String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            Some("it is no longer the regular file that was reviewed".to_owned())
+        }
+        Ok(_) => match read_owner(path, file.marker) {
+            Ok(Some(found)) if same_folder(&found, owner) => None,
+            Ok(_) => Some(format!(
+                "it no longer starts with the marker of the rocm-cli install in {}, so it is \
+                 not the file that was reviewed",
+                owner.display()
+            )),
+            Err(error) => Some(format!(
+                "it could not be read again to check that it is the file that was reviewed: \
+                 {error}"
+            )),
+        },
+        Err(_) => None,
+    }
 }
 
 /// Whether a record line names a path `install.sh` writes for `file`:
@@ -1250,11 +1299,23 @@ mod tests {
             let profile = layout.home.join(".bashrc");
             let contents = format!("export A=1\n{POSIX_BLOCK}");
             fs::write(&profile, &contents)?;
-            let record = record(&layout, &format!("profile {}\n", profile.display()))?;
+            let page = man_page(&layout)?;
+            let record = record(
+                &layout,
+                &format!("profile {}\nman {}\n", profile.display(), page.display()),
+            )?;
             // The edit writes its replacement beside the profile first; a folder
             // in that spot makes the write fail even for root.
             fs::create_dir(layout.home.join(".bashrc.rocm-uninstall.tmp"))?;
-            let (plan, config) = with_config(&layout, with_binaries(&layout, plan_for(&layout)))?;
+            // `with_binaries` replaces the actions, so the edits, and the
+            // recorded page with them, are planned after it.
+            let planned = || {
+                let mut plan = with_binaries(&layout, UninstallPlan::default());
+                plan_path_edits(&mut plan, &layout.bin, &layout.removed, Some(&layout.home));
+                with_config(&layout, plan)
+            };
+            let (plan, config) = planned()?;
+            assert_eq!(man_actions(&plan), vec![page.clone()], "{plan:?}");
 
             let (lines, result) = run(&plan);
             let message = format!("{:#}", result.expect_err("the PATH undo fails"));
@@ -1269,14 +1330,15 @@ mod tests {
             assert_eq!(fs::read_to_string(&profile)?, contents);
             assert!(layout.removed.iter().all(|path| path.exists()));
             assert!(config.join("config.json").exists(), "the settings stay");
+            assert!(page.exists(), "the manual page stays");
             assert!(record.exists(), "the record stays for the retry");
 
             // And the retry the message names does clear it.
             fs::remove_dir(layout.home.join(".bashrc.rocm-uninstall.tmp"))?;
-            let (plan, _) = with_config(&layout, with_binaries(&layout, plan_for(&layout)))?;
+            let (plan, _) = planned()?;
             run(&plan).1?;
             assert_eq!(fs::read_to_string(&profile)?, "export A=1\n");
-            assert!(!config.exists() && !record.exists());
+            assert!(!config.exists() && !record.exists() && !page.exists());
             Ok(())
         }
 
@@ -1734,6 +1796,23 @@ mod tests {
             Ok(())
         }
 
+        #[test]
+        fn the_manual_page_goes_even_when_the_path_change_stays_for_other_programs() -> Result<()> {
+            let layout = layout()?;
+            let profile = layout.home.join(".bashrc");
+            fs::write(&profile, POSIX_BLOCK)?;
+            fs::write(layout.bin.join("uv"), "")?;
+            let page = man_page(&layout)?;
+            record(
+                &layout,
+                &format!("profile {}\nman {}\n", profile.display(), page.display()),
+            )?;
+            let plan = plan_for(&layout);
+            assert!(plan.path_edits.is_empty(), "{plan:?}");
+            assert_eq!(man_actions(&plan), vec![page], "{plan:?}");
+            Ok(())
+        }
+
         /// Every file below carries this install's marker, so what stops each
         /// one is the check on the recorded path or on the kind of file.
         #[test]
@@ -1823,7 +1902,7 @@ mod tests {
         /// depending on the test's working folder, so the check is pinned
         /// directly.
         #[test]
-        fn only_an_absolute_completions_rocm_fish_path_is_the_installers() {
+        fn only_an_absolute_path_to_an_installer_file_is_the_installers() {
             let fish = &INSTALLER_FILES[0];
             assert!(is_recorded_installer_path(
                 Path::new("/home/me/.config/fish/completions/rocm.fish"),
@@ -2050,6 +2129,8 @@ mod tests {
             let record = record(&layout, "")?;
             let mut plan = with_binaries(&layout, plan_for(&layout));
             plan.path_record = Some(record.clone());
+            // As planning sets it for an installer file it checked.
+            plan.installer_files_owner = Some(layout.bin.clone());
             // A name too long for any filesystem fails to remove, even for root.
             let stuck = layout.home.join("x".repeat(300));
             plan.actions.insert(
@@ -2342,6 +2423,8 @@ mod tests {
             let record = record(&layout, "")?;
             let mut plan = with_binaries(&layout, plan_for(&layout));
             plan.path_record = Some(record.clone());
+            // As planning sets it for an installer file it checked.
+            plan.installer_files_owner = Some(layout.bin.clone());
             // A name too long for any filesystem fails to remove, even for root.
             let stuck = layout.home.join("x".repeat(300));
             plan.actions.insert(
@@ -2394,6 +2477,126 @@ mod tests {
                     )),
                 "{lines:?}"
             );
+            Ok(())
+        }
+
+        /// The review may sit at a prompt: a regular file written over the
+        /// planned one in the meantime is the user's, or another install's, so
+        /// it is left in place with a warning and the rest goes on. Both
+        /// installer files take this path.
+        #[test]
+        fn a_regular_file_written_over_an_installer_file_after_the_review_is_left_alone()
+        -> Result<()> {
+            let elsewhere = Path::new("/opt/other-rocm/bin");
+            for (kind, written_over) in [
+                (MANUAL_PAGE_KIND, ".TH MYNOTES 1\nmine\n".to_owned()),
+                (MANUAL_PAGE_KIND, marked_page(elsewhere)),
+                (
+                    SHELL_COMPLETIONS_KIND,
+                    "complete -c rocm # mine\n".to_owned(),
+                ),
+                (SHELL_COMPLETIONS_KIND, marked_script(elsewhere)),
+            ] {
+                let layout = layout()?;
+                let path = if kind == MANUAL_PAGE_KIND {
+                    let page = man_page(&layout)?;
+                    man_record(&layout, &page)?;
+                    page
+                } else {
+                    let script = fish_completions(&layout)?;
+                    completions_record(&layout, &script)?;
+                    script
+                };
+                // `with_binaries` replaces the actions, so the file is planned
+                // after it.
+                let mut plan = with_binaries(&layout, UninstallPlan::default());
+                plan_path_edits(&mut plan, &layout.bin, &layout.removed, Some(&layout.home));
+                assert!(
+                    plan.actions
+                        .iter()
+                        .any(|entry| entry.kind == kind && entry.path == path),
+                    "{plan:?}"
+                );
+                fs::write(&path, &written_over)?;
+
+                let (lines, result) = run(&plan);
+                result?;
+                assert_eq!(fs::read_to_string(&path)?, written_over, "{lines:?}");
+                assert!(
+                    lines.iter().any(|line| line
+                        == &format!(
+                            "warning: left {kind} {} in place: it no longer starts with the \
+                             marker of the rocm-cli install in {}, so it is not the file that \
+                             was reviewed",
+                            path.display(),
+                            layout.bin.display()
+                        )),
+                    "{lines:?}"
+                );
+                assert!(layout.removed.iter().all(|path| !path.exists()));
+            }
+            Ok(())
+        }
+
+        /// A planned installer file that cannot be read again just before it
+        /// goes cannot be shown to be the reviewed one, so it is left in place
+        /// with a warning saying why, and the rest goes on.
+        #[test]
+        fn an_installer_file_that_cannot_be_read_again_is_left_alone() -> Result<()> {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            man_record(&layout, &page)?;
+            // `with_binaries` replaces the actions, so the page is planned
+            // after it.
+            let mut plan = with_binaries(&layout, UninstallPlan::default());
+            plan_path_edits(&mut plan, &layout.bin, &layout.removed, Some(&layout.home));
+            assert_eq!(man_actions(&plan), vec![page.clone()], "{plan:?}");
+
+            let mut lines = Vec::new();
+            execute_plan_with(&plan, &mut |line| lines.push(line), |_, _| {
+                Err(std::io::Error::other("unreadable for the test"))
+            })?;
+            assert_eq!(fs::read_to_string(&page)?, marked_page(&layout.bin));
+            assert!(
+                lines.contains(&format!(
+                    "warning: left {MANUAL_PAGE_KIND} {} in place: it could not be read again \
+                     to check that it is the file that was reviewed: unreadable for the test",
+                    page.display()
+                )),
+                "{lines:?}"
+            );
+            assert!(layout.removed.iter().all(|path| !path.exists()));
+            Ok(())
+        }
+
+        /// A plan that lists an installer file but names no install folder
+        /// for its marker has nothing to check the file against again, so the
+        /// file is left in place with a warning saying so, and the rest goes
+        /// on.
+        #[test]
+        fn an_installer_file_planned_without_an_owner_is_left_alone() -> Result<()> {
+            let layout = layout()?;
+            let page = man_page(&layout)?;
+            let mut plan = with_binaries(&layout, UninstallPlan::default());
+            plan.actions
+                .push(crate::uninstall_plan::UninstallPlanEntry {
+                    kind: MANUAL_PAGE_KIND,
+                    path: page.clone(),
+                });
+            assert!(plan.installer_files_owner.is_none());
+
+            let (lines, result) = run(&plan);
+            result?;
+            assert_eq!(fs::read_to_string(&page)?, marked_page(&layout.bin));
+            assert!(
+                lines.contains(&format!(
+                    "warning: left {MANUAL_PAGE_KIND} {} in place: no install folder was \
+                     checked against its marker when the uninstall was planned",
+                    page.display()
+                )),
+                "{lines:?}"
+            );
+            assert!(layout.removed.iter().all(|path| !path.exists()));
             Ok(())
         }
 
