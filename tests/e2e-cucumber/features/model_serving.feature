@@ -980,4 +980,3 @@ Feature: Model serving
     And that log command shows the engine's last line
     And the failed launch is recorded as stopped
     And no background automation daemon was left behind
-
