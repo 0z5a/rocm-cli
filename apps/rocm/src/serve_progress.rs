@@ -621,7 +621,9 @@ impl ServeStartupStop {
             let stop = service_stop_hint(service_id);
             let _ = write!(
                 message,
-                "The server is still running (service {service_id}). Follow it with `{logs}`, or stop it with `{stop}`."
+                "The server is still running (service {service_id}). Follow it with `{logs}`, or stop it with `{stop}`. \
+                 If it is still not answering {minutes} minutes after it started, a running `rocm daemon` \
+                 with `server-recover` enabled may restart it."
             );
         } else if self.process_alive {
             // The engine said failed but its process has not exited yet.
@@ -1742,7 +1744,22 @@ mod tests {
             ServeStartupStopReason::SilentLoad,
             ServeStartupStopReason::Deadline,
         ] {
-            assert!(stop(reason, true).leaves_server_running(), "{reason:?}");
+            let stop = stop(reason, true);
+            assert!(stop.leaves_server_running(), "{reason:?}");
+            // The restart this names is real: `rocmd` spares a live startup only
+            // until the deadline, which
+            // `recovery_leaves_a_live_startup_alone_and_still_restarts_a_dead_one`
+            // and `recovery_leaves_a_live_starting_record_alone_until_the_startup_deadline`
+            // in apps/rocmd/src/watchers/server_recover.rs prove.
+            let minutes = rocm_core::SERVE_STARTUP_DEADLINE.as_secs() / 60;
+            let message = stop.user_message("qwen", "vllm", "svc-1");
+            assert!(
+                message.contains(&format!(
+                    "{minutes} minutes after it started, a running `rocm daemon` with \
+                     `server-recover` enabled may restart it"
+                )),
+                "{reason:?}: {message}"
+            );
         }
     }
 
