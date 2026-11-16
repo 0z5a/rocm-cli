@@ -467,7 +467,7 @@ then `rocm engines install lemonade`. Expected result:
   reinstall the backend (`Using installed Lemonade llamacpp:rocm backend.`). It
   prints `Lemonade's ROCm backend could not be aligned to ROCm 7.99.0 less than
   an hour ago; ...`, naming `rocm engines install lemonade --reinstall` and
-  when the alignment is tried again, and exits 0.
+  that an install run 24 hours from now or later tries it again, and exits 0.
 - Running the first command again attempts the alignment again (the warning
   is back), because `--reinstall` removed the record with the runtime tree.
 

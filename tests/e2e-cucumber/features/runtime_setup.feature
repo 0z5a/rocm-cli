@@ -733,9 +733,12 @@ Feature: Runtime configuration
   # 7.99.0 through the `rocm/e2e-test-hooks` variable
   # ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION, so every tier fails on every lane
   # without planting a runtime in the shared runtime tree. The Given's reinstall
-  # is also what the notice tells the user to run, so its alignment attempt shows
-  # the advice works. Same lane as runtime-16 and runtime-17: a real managed SDK
-  # and real backend downloads. `@requires-bare-metal` because under WSL2
+  # starts from a clean runtime tree; that `--reinstall` removes the record, as
+  # the notice says, is unit-tested by
+  # `reinstall_removes_the_record_of_a_failed_alignment` in
+  # engines/lemonade/src/install.rs, since on a fresh runner there is no record
+  # for this scenario's reinstall to remove. Same lane as runtime-16 and
+  # runtime-17: a real managed SDK and real backend downloads. `@requires-bare-metal` because under WSL2
   # Lemonade selects its Vulkan backend and never attempts the alignment.
   @id:runtime-lemonade-backend-alignment-failure-remembered @requires-gpu @requires-bare-metal @requires-engine:lemonade @nightly
   Scenario: runtime-33 - A Lemonade backend that could not be aligned is not retried by the next install

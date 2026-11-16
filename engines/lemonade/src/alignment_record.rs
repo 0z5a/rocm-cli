@@ -132,18 +132,21 @@ impl AlignmentFailure {
     /// The line printed when this record skipped the alignment and the pinned
     /// backend was installed instead. Built from the record and the same `now`
     /// [`Self::skips_alignment`] was asked with, so the times it names are the
-    /// ones the decision used.
+    /// ones the decision used. Nothing retries on its own: only an install that
+    /// runs once the record has expired attempts the alignment, so the line names
+    /// the earliest such install rather than a time something happens. That time
+    /// comes from [`ALIGNMENT_RETRY_AFTER`], the same window the decision uses.
     pub(crate) fn skip_notice(&self, now: SystemTime) -> String {
         let age = self.age(now).unwrap_or_default();
         let remaining = ALIGNMENT_RETRY_AFTER.saturating_sub(age);
         format!(
             "Lemonade's ROCm backend could not be aligned to ROCm {target} {ago}; using the \
              backend pinned for ROCm {pinned} instead. Run `{RETRY_ALIGNMENT_COMMAND}` to try \
-             again now, or the alignment is tried again {when}.",
+             again now; otherwise an install run {when} or later tries it again.",
             target = self.target_rocm_version,
             ago = describe_ago(age),
             pinned = self.pinned_rocm_version,
-            when = describe_in(remaining),
+            when = describe_from_now(remaining),
         )
     }
 }
@@ -159,15 +162,16 @@ fn describe_ago(age: Duration) -> String {
     }
 }
 
-/// "in less than an hour", "in 1 hour", "in 5 hours": whole hours, rounded up
-/// so it never names a time before the record expires.
-fn describe_in(remaining: Duration) -> String {
-    if remaining.as_secs() < HOUR {
-        return "in less than an hour".to_owned();
-    }
-    match remaining.as_secs().div_ceil(HOUR) {
-        1 => "in 1 hour".to_owned(),
-        hours => format!("in {hours} hours"),
+/// "1 hour from now", "5 hours from now": whole hours, rounded up from the full
+/// duration (a part of a second counts) so it never names a time before the
+/// record expires. Nothing left, which [`AlignmentFailure::skip_notice`] never
+/// passes since a record with no time left skips nothing, still reads as
+/// "1 hour from now" rather than "0 hours".
+fn describe_from_now(remaining: Duration) -> String {
+    const HOUR_NANOS: u128 = HOUR as u128 * 1_000_000_000;
+    match remaining.as_nanos().div_ceil(HOUR_NANOS).max(1) {
+        1 => "1 hour from now".to_owned(),
+        hours => format!("{hours} hours from now"),
     }
 }
 
@@ -175,6 +179,15 @@ fn describe_in(remaining: Duration) -> String {
 mod tests {
     use super::*;
     use crate::test_support::scratch_dir;
+
+    /// `ALIGNMENT_FAILURE_RECORD` in the black-box e2e steps
+    /// (tests/e2e-cucumber/tests/e2e/lemonade_install_steps.rs, used by
+    /// runtime-33) hard-codes this name to find the record on disk; renaming it
+    /// here means changing it there too.
+    #[test]
+    fn the_record_file_name_matches_the_one_the_e2e_steps_hard_code() {
+        assert_eq!(ALIGNMENT_FAILURE_RECORD, ".rocm-cli-alignment-failed.json");
+    }
 
     fn record(failed_at_unix_secs: u64) -> AlignmentFailure {
         AlignmentFailure {
@@ -272,19 +285,74 @@ mod tests {
             fresh.contains("`rocm engines install lemonade --reinstall`"),
             "{fresh}"
         );
-        assert!(fresh.contains("tried again in 24 hours"), "{fresh}");
+        // The time named comes from the window the decision uses, so the line
+        // cannot name a different one than `skips_alignment` applies.
+        let window_hours = ALIGNMENT_RETRY_AFTER.as_secs() / HOUR;
+        assert!(
+            fresh.ends_with(&format!(
+                "to try again now; otherwise an install run {window_hours} hours from now or \
+                 later tries it again."
+            )),
+            "{fresh}"
+        );
+        // The docs (docs/engine-plugins.md, docs/manual-testing.md) name 24 hours.
+        assert_eq!(window_hours, 24, "update the docs that name the window");
 
         let later = failure.skip_notice(at(FAILED_AT + 5 * HOUR + 1));
         assert!(later.contains("5 hours ago"), "{later}");
-        assert!(later.contains("tried again in 19 hours"), "{later}");
+        assert!(
+            later.contains("an install run 19 hours from now or later"),
+            "{later}"
+        );
 
         let one = failure.skip_notice(at(FAILED_AT + HOUR));
         assert!(one.contains("1 hour ago"), "{one}");
-        assert!(one.contains("in 23 hours"), "{one}");
+        assert!(one.contains("run 23 hours from now"), "{one}");
 
         let last = failure.skip_notice(at(FAILED_AT + 23 * HOUR + 1));
-        assert!(last.contains("in less than an hour"), "{last}");
+        assert!(last.contains("run 1 hour from now or later"), "{last}");
         let penultimate = failure.skip_notice(at(FAILED_AT + 23 * HOUR));
-        assert!(penultimate.contains("in 1 hour"), "{penultimate}");
+        assert!(
+            penultimate.contains("run 1 hour from now or later"),
+            "{penultimate}"
+        );
+        // The last second of the window still names a time after it.
+        let final_second = failure.skip_notice(at(FAILED_AT + 24 * HOUR - 1));
+        assert!(
+            final_second.contains("run 1 hour from now or later"),
+            "{final_second}"
+        );
+    }
+
+    /// `age` keeps the clock's sub-second part (the failure time is whole
+    /// seconds), so the time left is rarely whole seconds and a part of a second
+    /// must round up rather than be dropped.
+    #[test]
+    fn the_time_left_rounds_up_from_its_sub_second_part() {
+        let failure = record(FAILED_AT);
+        let window = ALIGNMENT_RETRY_AFTER.as_secs();
+
+        // 3,600.7 s left: "1 hour" would name a time 0.7 s before expiry.
+        let over_an_hour =
+            failure.skip_notice(at(FAILED_AT + window - HOUR - 1) + Duration::from_millis(300));
+        assert!(
+            over_an_hour.contains("run 2 hours from now or later"),
+            "{over_an_hour}"
+        );
+
+        // 0.3 s left.
+        let last_moment =
+            failure.skip_notice(at(FAILED_AT + window - 1) + Duration::from_millis(700));
+        assert!(
+            last_moment.contains("run 1 hour from now or later"),
+            "{last_moment}"
+        );
+
+        // No time left at all reads as the shortest wait, never "0 hours".
+        assert_eq!(describe_from_now(Duration::ZERO), "1 hour from now");
+        assert_eq!(
+            describe_from_now(Duration::from_nanos(1)),
+            "1 hour from now"
+        );
     }
 }
