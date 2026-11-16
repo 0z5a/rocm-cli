@@ -574,7 +574,7 @@ download percent, a load line, or a wait for the model to serve. A model that
 is still loading after 45 seconds (the old wait, which piped output still
 uses) keeps that line; it is not replaced by a finished "not ready yet"
 summary. The wait fails with a non-zero exit only when the engine fails or
-exits, a download percent stops for 3 minutes, the port stays closed with no
+exits, a download percent stops for 3 minutes, the endpoint has not listed the model with no
 engine log for 2 minutes, a load line stops changing for 5 minutes, or 30
 minutes pass. When the endpoint answers, the
 command prints the deployment summary and returns to the shell. If the wait

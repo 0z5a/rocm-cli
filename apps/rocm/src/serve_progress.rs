@@ -48,10 +48,10 @@ pub(crate) const DOWNLOAD_STALL: Duration = Duration::from_mins(3);
 /// Interactive summary mode follows the stage instead.
 pub(crate) const PIPED_SERVE_STATUS_BUDGET: Duration = Duration::from_secs(45);
 
-/// Port down and no meaningful log line.
+/// Endpoint not listing the model and no meaningful log line.
 pub(crate) const SILENT_UNREACHABLE: Duration = Duration::from_mins(2);
 
-/// A load line that stops changing while the port is still down.
+/// A load line that stops changing while the endpoint has not listed the model.
 pub(crate) const SILENT_LOAD: Duration = Duration::from_mins(5);
 
 const POLL: Duration = Duration::from_millis(250);
@@ -628,7 +628,8 @@ impl ServeStartupStop {
             let stop = service_stop_hint(service_id);
             let _ = write!(
                 message,
-                "Its process is still up (service {service_id}). The log is `{logs}`; `{stop}` stops it."
+                "Its process is still up (service {service_id}). The log is `{logs}`; `{stop}` stops it. \
+                 A running `rocm daemon` with `server-recover` enabled may restart it first."
             );
         } else {
             let _ = write!(
@@ -1716,6 +1717,11 @@ mod tests {
             // stops it; one that is gone does not.
             assert_eq!(
                 message.contains(&service_stop_hint("svc-1")),
+                alive,
+                "{reason:?} alive={alive}: {message}"
+            );
+            assert_eq!(
+                message.contains("may restart it first"),
                 alive,
                 "{reason:?} alive={alive}: {message}"
             );

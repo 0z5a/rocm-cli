@@ -175,13 +175,12 @@ pub(crate) fn start_managed_service(
         }
         .into());
     }
-    // A stall or the deadline left the server up: `running`, which `rocmd`
-    // leaves alone until the startup deadline.
-    let launch_status = if startup_stop.is_some() {
-        "running"
-    } else {
-        status_for_readiness(readiness)
-    };
+    // A stall or the deadline left the server up. Its status follows how far
+    // the endpoint got, as for any other launch: `running` only when the model
+    // is listed, `starting` when it never opened, so `rocm services`, dash and
+    // chat do not show a server that has not listed its model as up.
+    // `rocmd` leaves a live `starting` record alone until the startup deadline.
+    let launch_status = status_for_readiness(readiness);
     let recorded = record_wait_outcome(
         paths,
         &mut record,
@@ -577,8 +576,8 @@ mod tests {
     }
 
     /// A fresh launch whose wait stops on a live server: the wait is announced
-    /// first, the server is left running and recorded `running` without an
-    /// inference verification, and the typed failure names that service's
+    /// first, the server is left running and recorded `starting` (its endpoint
+    /// never listed the model) without an inference verification, and the typed failure names that service's
     /// logs and stop commands and asks `serve` to supervise it.
     #[cfg(not(windows))]
     #[test]
@@ -596,7 +595,9 @@ mod tests {
         }
         assert_eq!(launch.announced, [service_id], "the wait is announced once");
         let record = launch.record?;
-        assert_eq!(record.status, "running", "the live server stays recorded");
+        // The endpoint never listed the model, so the record says `starting`, not
+        // `running`, which elsewhere means "lists the model".
+        assert_eq!(record.status, "starting", "the live server stays recorded");
         assert_eq!(record.inference_verified_at_unix_ms, None);
         Ok(())
     }

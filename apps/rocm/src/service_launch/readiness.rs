@@ -223,6 +223,36 @@ pub(crate) const fn e2e_simulate_oom_launch() -> bool {
     false
 }
 
+/// Test-only switch for the mock lane, compiled in only with
+/// `e2e-oom-fault-injection` and read only on Linux: a managed launch spawns a
+/// stand-in engine that writes one log line and exits during startup, in place
+/// of the real `rocm` serve child, so the interactive startup wait's
+/// process-exited path runs end to end on a host with no GPU. Everything else
+/// about the launch (record, log, wait, settling) is the production path.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+pub(crate) fn e2e_simulate_startup_exit() -> bool {
+    std::env::var_os(SIMULATE_STARTUP_EXIT_ENV).is_some_and(|value| value == "1")
+}
+
+/// Release builds, and hosts other than Linux, carry no such switch.
+#[cfg(not(all(feature = "e2e-oom-fault-injection", target_os = "linux")))]
+pub(crate) const fn e2e_simulate_startup_exit() -> bool {
+    false
+}
+
+/// The variable [`e2e_simulate_startup_exit`] reads; the e2e step spells the
+/// same name, since the shipped crate must not depend on the harness.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+const SIMULATE_STARTUP_EXIT_ENV: &str = "ROCM_E2E_SIMULATE_STARTUP_EXIT";
+
+/// What the stand-in engine runs: one meaningful log line, then an exit after
+/// the spawn's immediate-exit check, so the launch is published and the
+/// startup wait (not the spawn) is what sees the process end.
+#[cfg(all(feature = "e2e-oom-fault-injection", target_os = "linux"))]
+pub(super) const SIMULATED_STARTUP_EXIT_SCRIPT: &str =
+    "echo 'e2e stand-in engine: loading model weights'; sleep 2; \
+     echo 'e2e stand-in engine: exiting during startup'; exit 1";
+
 /// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
 /// managed vLLM launch that spawned, OOM'd, and never became ready, then return
 /// the launch report the summary path would see for it — `already_running: false`

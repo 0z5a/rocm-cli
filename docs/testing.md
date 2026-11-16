@@ -2218,8 +2218,8 @@ serve or that wait fails. A download that is still moving is not cut off at
 45 seconds, and a failure names `rocm logs --service <service-id>` and
 `rocm services stop <service-id> --yes` instead of printing
 `Deployment summary (not ready yet)`. The wait fails when the engine fails or
-exits, a download percent stops for 3 minutes (`DOWNLOAD_STALL`), the port
-stays closed with no log for 2 minutes (`SILENT_UNREACHABLE`), a load line
+exits, a download percent stops for 3 minutes (`DOWNLOAD_STALL`), the endpoint
+has not listed the model, with no log, for 2 minutes (`SILENT_UNREACHABLE`), a load line
 stops changing for 5 minutes (`SILENT_LOAD`), or after 30 minutes
 (`rocm_core::SERVE_STARTUP_DEADLINE`). Engine log lines are masked of
 credentials before they are shown (`redact_log_line`). Once the endpoint lists the model,
@@ -2246,7 +2246,13 @@ deadline leaves the server running for the background helper to supervise.
 Scenario `serve-59` in `model_serving.feature` drives it under a PTY. It
 needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes only;
 it checks the wait line, that the named `rocm logs --service` command runs,
-and that the serve exits 0 with the model listed. The stall, deadline and
+and that the serve exits 0 with the model listed. Scenario `serve-60` is the
+failure side on the no-GPU mock lane: with `ROCM_E2E_SIMULATE_STARTUP_EXIT=1`,
+an `e2e-oom-fault-injection` build (Linux only) spawns a stand-in engine that
+logs one line and exits during startup, in place of the real child. It checks
+the non-zero exit and the "server process exited" message, runs the
+`rocm logs --service` command the failure names, and checks the record is
+`stopped` (`cargo xtask e2e -- -n "serve-60"`). The stall, deadline and
 engine-failed branches need a controllable engine, so `decide_serve_startup` and `wait_for_serve_startup` in
 [serve_progress.rs](../apps/rocm/src/serve_progress.rs) are the state matrix,
 covered by:

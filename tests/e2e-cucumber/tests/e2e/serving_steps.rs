@@ -695,6 +695,120 @@ async fn serve_exits_and_endpoint_lists_model(world: &mut E2eWorld) {
     world.endpoint = Some(SERVE_BASE_URL.to_string());
 }
 
+#[given("a managed engine will exit while it starts")]
+async fn arm_startup_exit_stand_in(world: &mut E2eWorld) {
+    // Consumed by `e2e_simulate_startup_exit` in
+    // `apps/rocm/src/service_launch/readiness.rs`; spelled out on both sides
+    // for the same reason as `ROCM_E2E_SIMULATE_OOM_LAUNCH`. A typo does not
+    // arm the stand-in, the no-GPU pre-flight refuses, and the Then steps fail.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_STARTUP_EXIT", "1".into()));
+}
+
+#[when("the user serves a model with that engine under a real terminal")]
+async fn serve_with_startup_exit_stand_in(world: &mut E2eWorld) {
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-startup-exit",
+        ],
+    )
+    .unwrap_or_else(|e| panic!("failed to spawn `rocm serve` under a pty: {e}"));
+    let code = session
+        .wait_for_exit_code(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("`rocm serve` did not exit: {e}"));
+    world.tui = Some(session);
+    world.cli_rc = Some(code);
+}
+
+/// The final screen with all whitespace removed: the 80-column PTY wraps the
+/// failure message across rows.
+fn startup_exit_screen(world: &E2eWorld) -> (String, String) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no pty session for `rocm serve`")
+        .screen_text();
+    (screen_without_whitespace(&screen), screen)
+}
+
+/// The id in the failure's "The log is `rocm logs --service <id>`".
+fn failed_launch_service_id(world: &E2eWorld) -> String {
+    let (flat, screen) = startup_exit_screen(world);
+    let marker = "Thelogis`rocmlogs--service";
+    let rest = flat
+        .split(marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the failure does not name `rocm logs --service`:\n{screen}"));
+    let id = rest.split('`').next().unwrap_or_default().trim_matches('\'');
+    assert!(!id.is_empty(), "no service id in the log hint:\n{screen}");
+    id.to_owned()
+}
+
+#[then("the serve fails saying the server process exited")]
+async fn serve_fails_with_process_exited(world: &mut E2eWorld) {
+    let (flat, screen) = startup_exit_screen(world);
+    let code = world.cli_rc;
+    assert!(
+        code.is_some_and(|code| code != 0),
+        "an engine that exited during startup must fail the serve (exit {code:?}):\n{screen}"
+    );
+    assert!(
+        flat.contains("failed:theserverprocessexited"),
+        "the failure must say the server process exited:\n{screen}"
+    );
+    assert!(
+        flat.contains("Theserverdidnotstart"),
+        "the failure must say the server did not start, not that it is still running:\n{screen}"
+    );
+}
+
+#[then("the failure names the command that shows the server's log")]
+async fn failure_names_log_command(world: &mut E2eWorld) {
+    failed_launch_service_id(world);
+}
+
+#[then("that log command shows the engine's last line")]
+async fn log_command_shows_engine_line(world: &mut E2eWorld) {
+    let id = failed_launch_service_id(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["logs", "--service", &id]);
+    assert_eq!(
+        rc, 0,
+        "`rocm logs --service {id}` failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("e2e stand-in engine: exiting during startup"),
+        "`rocm logs --service {id}` does not show the engine's last line:\n{stdout}"
+    );
+}
+
+#[then("the failed launch is recorded as stopped")]
+async fn failed_launch_recorded_stopped(world: &mut E2eWorld) {
+    let id = failed_launch_service_id(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "list", "--all", "--json"]);
+    assert_eq!(rc, 0, "`rocm services list --all --json` failed:\n{stderr}");
+    let records: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("services list --json did not parse: {e}\n{stdout}"));
+    let status = records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|record| record.get("service_id").and_then(serde_json::Value::as_str) == Some(&id))
+        .and_then(|record| record.get("status").and_then(serde_json::Value::as_str))
+        .unwrap_or_else(|| panic!("no record for {id}:\n{stdout}"))
+        .to_owned();
+    // `stopped`, not `failed`: `rocmd` restarts a `failed` record with no stop
+    // marker, behind the error the user just read.
+    assert_eq!(status, "stopped", "{stdout}");
+}
+
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
     serve_gpu_model(world).await;
