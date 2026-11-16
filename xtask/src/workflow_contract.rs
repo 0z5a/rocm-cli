@@ -4943,9 +4943,12 @@ fi
     /// in the run's conclusion, so a broken lane is indistinguishable from a
     /// passing one everywhere but its own log. A step-level one lets the
     /// failing step pass the job. The lanes run in separate jobs with
-    /// `fail-fast: false`, and each workflow's consolidated report job is gated
-    /// on `always()`, so an unmasked failure neither cancels a sibling lane nor
-    /// skips the report.
+    /// `fail-fast: false`, so an unmasked failure does not cancel a sibling
+    /// lane. Both consolidated report jobs are pinned to run on `always()`, so
+    /// a failed lane does not skip them: nightly's `e2e-report-nightly` by
+    /// `e2e_lanes_do_not_mask_failures_with_continue_on_error`, and
+    /// e2e-selfhosted's `e2e-report` by
+    /// `closing_a_pr_supersedes_its_self_hosted_runs`.
     fn mask_failure(workflow: &str, text: &str) -> Option<String> {
         let lines = continue_on_error_lines(text);
         if lines.is_empty() {
