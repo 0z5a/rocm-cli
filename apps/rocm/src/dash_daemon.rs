@@ -763,7 +763,26 @@ mod tests {
 
     /// Install a subscriber at `level` for this test's thread (the keeper runs
     /// on it: `#[tokio::test]` is single-threaded) and return what it writes.
+    ///
+    /// It first makes sure two more dispatchers are registered for the rest
+    /// of the process. tracing-core caches each callsite's interest when the
+    /// callsite is first hit, and while at most one dispatcher is registered
+    /// (`callsite::dispatchers::Rebuilder::JustOne` in tracing-core) it asks
+    /// only the default subscriber *of the thread that hit it*. A test running
+    /// in parallel with no subscriber would then cache the callsite as never
+    /// enabled, and this subscriber would miss it. With more than one
+    /// registered, tracing-core asks every live dispatcher, under the lock a
+    /// new dispatcher takes to rebuild the cache, so the interest cached is
+    /// the same on every thread. Mirrors `log_at` in rocm-dash-daemon's
+    /// `server.rs` tests.
     fn log_at(level: tracing::Level) -> (Captured, tracing::subscriber::DefaultGuard) {
+        static KEEP_INTEREST_SHARED: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+            std::sync::OnceLock::new();
+        KEEP_INTEREST_SHARED.get_or_init(|| {
+            std::array::from_fn(|_| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            })
+        });
         let captured = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(level)

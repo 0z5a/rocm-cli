@@ -1128,14 +1128,7 @@ mod tests {
     /// directory, logs nothing.
     #[test]
     fn tightens_owned_preexisting_parent() {
-        let captured = Captured::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .with_ansi(false)
-                .with_writer(captured.clone())
-                .finish(),
-        );
+        let (captured, _guard) = log_at(tracing::Level::INFO);
         let log = || String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
         let tmp = tempfile::tempdir().unwrap();
         let parent = tmp.path().join("loose");
@@ -1294,12 +1287,24 @@ mod tests {
     }
 
     /// A socket file with nobody listening, as a killed daemon leaves behind.
+    ///
+    /// Dropping the listener does not always close the socket at once: a
+    /// test running in parallel may have started a child process (the
+    /// runner's `amd-smi` detection, through `std`/`tokio` `Command`) while
+    /// the listener was open, and the child holds a copy of its descriptor
+    /// until it execs, when `O_CLOEXEC` closes it. Until then the socket still
+    /// accepts. So wait, within [`DEADLINE`], until a connection is refused;
+    /// no later child can inherit a descriptor this process already closed.
     fn stale_socket(path: &Path) {
         drop(std::os::unix::net::UnixListener::bind(path).expect("bind the soon-stale socket"));
-        assert!(
-            std::os::unix::net::UnixStream::connect(path).is_err(),
-            "the fixture must be stale: nothing may answer"
-        );
+        let deadline = std::time::Instant::now() + DEADLINE;
+        while std::os::unix::net::UnixStream::connect(path).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture must be stale: something still answers after {DEADLINE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Keep the inode at `path` allocated by giving it a second name, so that
@@ -2522,6 +2527,38 @@ mod tests {
     #[derive(Clone, Default)]
     struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
+    /// Install a subscriber at `level` for this test's thread and return what
+    /// it writes. The code under test must run on this thread (a
+    /// `#[tokio::test]` runtime is single-threaded).
+    ///
+    /// It first makes sure two more dispatchers are registered for the rest
+    /// of the process. tracing-core caches each callsite's interest when the
+    /// callsite is first hit, and while at most one dispatcher is registered
+    /// (`callsite::dispatchers::Rebuilder::JustOne` in tracing-core) it asks
+    /// only the default subscriber *of the thread that hit it*. A test running
+    /// in parallel with no subscriber would then cache the callsite as never
+    /// enabled, and this subscriber would miss it. With more than one
+    /// registered, tracing-core asks every live dispatcher, under the lock a
+    /// new dispatcher takes to rebuild the cache, so the interest cached is
+    /// the same on every thread. Mirrors `log_at` in the `rocm` app's
+    /// `dash_daemon.rs` tests.
+    fn log_at(level: tracing::Level) -> (Captured, tracing::subscriber::DefaultGuard) {
+        static KEEP_INTEREST_SHARED: std::sync::OnceLock<[tracing::Dispatch; 2]> =
+            std::sync::OnceLock::new();
+        KEEP_INTEREST_SHARED.get_or_init(|| {
+            std::array::from_fn(|_| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            })
+        });
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
     impl std::io::Write for Captured {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
@@ -2545,14 +2582,7 @@ mod tests {
     /// single-threaded), where the subscriber is installed.
     #[tokio::test]
     async fn the_shared_directory_warning_comes_once_from_the_daemon_that_claims_the_path() {
-        let captured = Captured::default();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .with_writer(captured.clone())
-                .finish(),
-        );
+        let (captured, _guard) = log_at(tracing::Level::WARN);
         let warnings = || {
             String::from_utf8_lossy(&captured.0.lock().unwrap())
                 .matches("shared sticky directory")
