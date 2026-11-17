@@ -288,10 +288,25 @@ fn ensure_sessions_dir_owned_by(paths: &AppPaths, owner: Option<u32>) -> Result<
 /// it is a link, the link too — then drop group and other access from it.
 #[cfg(unix)]
 fn claim_existing_dir(directory: &Path, owner: u32) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
     let link = fs::symlink_metadata(directory)
         .with_context(|| format!("failed to inspect {}", directory.display()))?;
-    let target = fs::metadata(directory)
+    // The owner check and the `chmod` act on one opened directory rather than
+    // re-resolving the path for each, as `read_one` does for a record. When the
+    // path was not a link, `O_NOFOLLOW` makes the open fail if a link has been
+    // put there since, instead of following it.
+    let follow = if link.file_type().is_symlink() {
+        0
+    } else {
+        libc::O_NOFOLLOW
+    };
+    let opened = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | follow)
+        .open(directory)
+        .with_context(|| format!("failed to open {}", directory.display()))?;
+    let target = opened
+        .metadata()
         .with_context(|| format!("failed to inspect {}", directory.display()))?;
     if let Some(found) = first_foreign_uid(&[link.uid(), target.uid()], owner) {
         bail!(
@@ -320,7 +335,8 @@ fn claim_existing_dir(directory: &Path, owner: u32) -> Result<()> {
                  with a directory of your own"
             );
         }
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        opened
+            .set_permissions(fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to restrict {} to its owner", directory.display()))?;
     }
     Ok(())
