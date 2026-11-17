@@ -229,7 +229,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ),
             (
                 "logs",
-                format!("rocm logs --service {}", summary.service_id),
+                crate::service_hints::service_logs_hint(&summary.service_id),
             ),
         ],
     ]
@@ -266,8 +266,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         };
         let _ = writeln!(
             out,
-            "  note: {explanation} - follow `rocm logs --service {} --follow` or check `rocm services list`",
-            summary.service_id
+            "  note: {explanation} - follow `{}` or check `rocm services list`",
+            crate::service_hints::service_logs_follow_hint(&summary.service_id)
         );
     }
     if let (true, Some(reason)) = (smoke_failed, summary.smoke_failure.as_deref()) {
@@ -276,8 +276,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         // empty, hedged: the reason may be rocm's own plumbing, not the engine.
         let _ = writeln!(
             out,
-            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `rocm logs --service {id}`",
-            id = summary.service_id
+            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `{logs}`",
+            logs = crate::service_hints::service_logs_hint(&summary.service_id)
         );
     }
     for note in &summary.notes {

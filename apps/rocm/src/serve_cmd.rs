@@ -1181,7 +1181,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 spinner.borrow_mut().clear();
                 eprintln!(
                     "Waiting for {waiting_on}; Ctrl-C stops waiting, the server keeps running. \
-                     Follow: rocm logs --service {waiting_on} --follow"
+                     Follow: {}",
+                    crate::service_hints::service_logs_follow_hint(waiting_on)
                 );
                 if let Some(config) = wait_begin_client_config(
                     waiting_on,
