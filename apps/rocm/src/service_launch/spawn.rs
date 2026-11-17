@@ -8,9 +8,9 @@
 
 use super::endpoint_auth::ensure_public_service_has_endpoint_key;
 use super::launch_transaction::{
-    ManagedPortDecision, ManagedReuseRefusal, abandon_failed_managed_launch, launch_still_owns,
-    managed_service_reuse_refusal, no_usable_gpu_refusal, resolve_managed_port_in_transaction,
-    update_managed_record_on_disk,
+    ManagedPortDecision, ManagedReuseRefusal, RecordUpdate, abandon_failed_managed_launch,
+    launch_still_owns, managed_service_reuse_refusal, no_usable_gpu_refusal,
+    resolve_managed_port_in_transaction, update_managed_record_on_disk,
 };
 use crate::endpoint_keys;
 use crate::engine_ipc::builtin_engine_serve_http_args;
@@ -639,6 +639,23 @@ fn launch_managed_engine_child_locked(
         fail_if_engine_died_at_startup(startup_exit, &record.log_path)?;
         child_pid
     };
+    publish_spawned_engine(paths, service_id, record, child_pid)
+}
+
+/// Put a spawned engine on the launch's record as `running`, as the last step of
+/// the launch, or fail it when a stop or removal has settled the claim since.
+///
+/// A failure leaves `record.engine_pid` naming the child, which is what
+/// `abandon_failed_managed_launch` terminates; that is how the failure's own
+/// "the failed launch terminates it" comes true. Shared by both platforms and
+/// kept apart from the spawn so a test can drive it with a real child on every
+/// lane, Windows included.
+fn publish_spawned_engine(
+    paths: &AppPaths,
+    service_id: &str,
+    record: &mut ManagedServiceRecord,
+    child_pid: u32,
+) -> Result<u32> {
     // The child is both roles until the engine state file names a separate
     // server process. Each role gets its own token, captured while the child is
     // alive: a stop pairs every recorded PID with its own token, and the two
@@ -678,14 +695,14 @@ fn launch_managed_engine_child_locked(
         },
     )
     .context("failed to publish the managed service record")?;
-    let Some(published) = published else {
+    let RecordUpdate::Written(published) = published else {
         bail!(
             "managed service `{service_id}` was stopped or removed while it was launching, so \
              the engine it started (pid {child_pid}) is not recorded on it; the failed launch \
              terminates it"
         );
     };
-    *record = published;
+    *record = *published;
 
     Ok(child_pid)
 }
@@ -695,7 +712,6 @@ mod tests {
     use super::*;
     use crate::managed_service_status::load_managed_services;
     use crate::service_launch::launch_transaction::live_managed_services;
-    #[cfg(not(windows))]
     use crate::service_launch::test_support::sleeper_test_name;
     use crate::service_launch::test_support::write_live_service_record;
     use crate::tests::test_paths;
@@ -1552,6 +1568,97 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
+    }
+
+    /// The step after the spawn, on every platform and so on the Windows gate:
+    /// a stop that settled the claim while the engine spawned fails the publish,
+    /// keeps its `stopped` and stop marker, and the cleanup the failure promises
+    /// ("the failed launch terminates it") terminates the real child through the
+    /// same routine a stop uses — a tree kill on Windows.
+    #[test]
+    fn a_publish_refused_by_a_stop_leaves_the_stop_and_the_cleanup_ends_the_engine() -> Result<()> {
+        let (root, paths) = test_paths("publish-refused-by-stop");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-publish-refused",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11_489,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+        // `std::process` paths spelled out: this module imports `Command` and
+        // `Stdio` only off Windows, and this test runs on Windows too.
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg(sleeper_test_name())
+            .arg("--ignored")
+            .arg("--test-threads=1")
+            .env("ROCM_TEST_SLEEPER_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let child_pid = child.id();
+        // As both platforms do before the publish: the engine is on the held
+        // record with its token, so cleanup knows what to terminate.
+        record.record_engine_identity(child_pid);
+        // `rocm services stop` settles the claim meanwhile; it takes no launch lock.
+        let mut stopped = ManagedServiceRecord::read_manifest(&paths, &record.service_id)?;
+        stopped.stop_requested_unix_ms = Some(4_244);
+        stopped.status = "stopped".to_owned();
+        stopped.write()?;
+
+        let result =
+            publish_spawned_engine(&paths, &record.service_id.clone(), &mut record, child_pid);
+        let error = result.as_ref().err().map(|error| format!("{error:#}"));
+        abandon_failed_managed_launch(&paths, &record, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut exited = false;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait()?.is_some() {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id);
+        let _ = fs::remove_dir_all(root);
+        let after = after?;
+        let error = error.expect("a publish over a settled stop must fail");
+        assert!(
+            error.contains("was stopped or removed while it was launching")
+                && error.contains(&format!("(pid {child_pid})"))
+                && error.contains("the failed launch terminates it"),
+            "{error}"
+        );
+        assert!(
+            exited,
+            "the engine the failure says is terminated is still running"
+        );
+        assert_eq!(after.status, "stopped", "the stop was overwritten");
+        assert_eq!(
+            after.stop_requested_unix_ms,
+            Some(4_244),
+            "the stop marker was erased"
+        );
+        assert_eq!(
+            after.engine_pid, None,
+            "the refused engine was put on record"
+        );
+        Ok(())
     }
 
     /// The publish writes the launch's own fields onto the record as it is on

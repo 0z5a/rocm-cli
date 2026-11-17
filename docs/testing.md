@@ -2450,8 +2450,10 @@ cargo test -p rocm --bin rocm service_launch::spawn::tests::a_child_that_exited_
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_signalled
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::an_engine_seen_dead_at_startup_is_never_handed
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_keeps_the_key
+cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_over_an_unreadable
 cargo test -p rocm --bin rocm service_launch::launch_transaction::tests::abandoning_a_launch_does_not_recreate_a_removed_record
 cargo test -p rocm --bin rocm service_launch::spawn::tests::a_stop_settled_while_the_engine_spawns
+cargo test -p rocm --bin rocm service_launch::spawn::tests::a_publish_refused_by_a_stop
 cargo test -p rocm --bin rocm service_launch::readiness::tests::a_stop_settled_during_the_wait
 cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_keeps_what_changed
 cargo test -p rocm --bin rocm service_launch::readiness::tests::record_wait_outcome_does_not_recreate
@@ -2480,7 +2482,10 @@ the record and then writes it, with no lock against a stop, so a stop landing
 between the two is still overwritten: the tests pin the narrowed race, not a
 closed one. The publish applies only the launch's own fields (engine and
 supervisor identities, `running`) over the record on disk, and a failed launch's
-cleanup leaves the endpoint key of a record a restart took over.
+cleanup leaves the endpoint key of a record a restart took over, or of one it
+cannot read, which it audits. A publish refused by a stop, and the cleanup
+terminating the engine it then names, run on the required Windows lane too
+(`a_publish_refused_by_a_stop_*`, with a real child and a tree kill there).
 The `watched_detached_spawn_*` tests run on the required Windows lane.
 
 `serve-61` (`@id:serve-managed-engine-dies-at-startup`) is the black-box half: an

@@ -192,16 +192,32 @@ fn abandon_failed_managed_launch_with(
         if let Some(pid) = spawned_pid.filter(|_| !child_known_dead) {
             terminate_abandoned_launch_child(paths, record, pid, terminate);
         }
-        let marked = update_managed_record_on_disk(
+        match update_managed_record_on_disk(
             paths,
             &record.service_id,
             |current| launch_still_owns(current, record),
             ManagedServiceRecord::mark_launch_abandoned,
-        );
-        let owned_by_someone_else =
-            matches!(marked, Ok(None)) && paths.service_manifest_path(&record.service_id).exists();
-        if !owned_by_someone_else {
-            endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+        ) {
+            Ok(RecordUpdate::Written(_) | RecordUpdate::Gone) => {
+                endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+            }
+            // A restart that took the record over stores its key under the same
+            // service id, and a stop that settled it does its own key cleanup.
+            Ok(RecordUpdate::NotOwned(_)) => {}
+            // The record is there but could not be read, so whose it is now is
+            // unknown: keep the key rather than guess, and leave a trace, since
+            // cleanup must not fail the launch a second time.
+            Err(error) => record_cli_audit_event(
+                paths,
+                "service",
+                "managed_service_launch_cleanup",
+                "warn",
+                format!(
+                    "could not mark the failed launch stopped; its record and endpoint key \
+                     were left as they are: {error:#}"
+                ),
+                Some(&record.service_id),
+            ),
         }
         return;
     }
@@ -276,17 +292,18 @@ fn terminate_abandoned_launch_child(
 /// bringing back as live a service the stop just reported stopped, and with it
 /// the marker that keeps `rocmd`'s recovery off it.
 ///
-/// Returns `Ok(None)`, writing nothing, when the record is gone or
-/// `still_owned` refuses the record as it is now: whoever wrote since holds a
-/// truer view. This narrows the lost-update window; it does not close it, since
-/// the read and the write are separate steps and a stop takes no lock on the
-/// manifest.
+/// Writes nothing when the record is gone or `still_owned` refuses the record
+/// as it is now — whoever wrote since holds a truer view — and says which, so a
+/// caller can tell the two apart without reading the record again. This narrows
+/// the lost-update window; it does not close it, since the read and the write
+/// are separate steps and nothing that writes a service record (a stop, a
+/// removal, `rocmd`, the liveness refresh) takes a lock on it.
 pub(super) fn update_managed_record_on_disk(
     paths: &AppPaths,
     service_id: &str,
     still_owned: impl FnOnce(&ManagedServiceRecord) -> bool,
     update: impl FnOnce(&mut ManagedServiceRecord),
-) -> Result<Option<ManagedServiceRecord>> {
+) -> Result<RecordUpdate> {
     // One read, not an `exists()` check before it: a removal landing between
     // the two would turn "the record is gone" into a read error.
     let mut current = match ManagedServiceRecord::read_manifest(paths, service_id) {
@@ -296,16 +313,28 @@ pub(super) fn update_managed_record_on_disk(
                 .downcast_ref::<rocm_core::ManagedServiceNotFound>()
                 .is_some() =>
         {
-            return Ok(None);
+            return Ok(RecordUpdate::Gone);
         }
         Err(error) => return Err(error),
     };
     if !still_owned(&current) {
-        return Ok(None);
+        return Ok(RecordUpdate::NotOwned(Box::new(current)));
     }
     update(&mut current);
     current.write()?;
-    Ok(Some(current))
+    Ok(RecordUpdate::Written(Box::new(current)))
+}
+
+/// What [`update_managed_record_on_disk`] did with the record on disk.
+#[derive(Debug)]
+pub(super) enum RecordUpdate {
+    /// The change was applied; this is the record as written.
+    Written(Box<ManagedServiceRecord>),
+    /// The record is there but `still_owned` refused it; this is the record as
+    /// read, left unchanged.
+    NotOwned(Box<ManagedServiceRecord>),
+    /// There is no record for the service.
+    Gone,
 }
 
 /// Whether the launch that wrote `launched` may still write `current`, the same
@@ -1314,8 +1343,8 @@ mod tests {
         let after = ManagedServiceRecord::read_manifest(&paths, &launched.service_id)?;
         let _ = fs::remove_dir_all(root);
         assert!(
-            written.is_none(),
-            "the launch wrote over a restart's record"
+            matches!(written, RecordUpdate::NotOwned(_)),
+            "the launch wrote over a restart's record: {written:?}"
         );
         assert_eq!(after.status, "starting");
         assert_eq!(after.supervisor_pid, taken.supervisor_pid);
@@ -1413,6 +1442,45 @@ mod tests {
                 assert_eq!(persisted.status, "stopped");
             }
         }
+        Ok(())
+    }
+
+    /// A record that is there but cannot be read says nothing about whose it is
+    /// now, so the cleanup keeps the endpoint key and leaves the record's bytes
+    /// alone, and audits that it did so instead of failing the launch twice.
+    #[test]
+    fn abandoning_a_launch_over_an_unreadable_record_keeps_the_key_and_says_so() -> Result<()> {
+        let (root, paths) = test_paths("abandon-unreadable-record");
+        paths.ensure()?;
+        let launched = write_live_service_record(
+            &paths,
+            "lemonade-abandon-unreadable",
+            "abandon-unreadable-model",
+            11_488,
+            "starting",
+        )?;
+        endpoint_keys::store_endpoint_api_key(&paths, &launched.service_id, "unknown-owner-key")?;
+        fs::write(&launched.manifest_path, b"{ not a service record")?;
+
+        abandon_failed_managed_launch(&paths, &launched, true);
+
+        let key = endpoint_keys::endpoint_api_key(&paths, &launched.service_id);
+        let bytes = fs::read(&launched.manifest_path)?;
+        let audit = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            key.as_deref(),
+            Some("unknown-owner-key"),
+            "the key was cleared"
+        );
+        assert_eq!(
+            bytes, b"{ not a service record",
+            "the unreadable record was rewritten"
+        );
+        assert!(
+            audit.contains("could not mark the failed launch stopped"),
+            "the skipped cleanup left no trace: {audit}"
+        );
         Ok(())
     }
 

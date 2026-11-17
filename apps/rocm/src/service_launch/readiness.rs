@@ -14,7 +14,7 @@
 // would be unused in some build, and a gate on it would have to be kept in step
 // with every use site. Keep the full paths. The tests module imports `fs` for
 // itself because its tests use it on every platform.
-use super::launch_transaction::update_managed_record_on_disk;
+use super::launch_transaction::{RecordUpdate, update_managed_record_on_disk};
 use super::spawn::ManagedLaunchReport;
 #[cfg(feature = "e2e-oom-fault-injection")]
 use crate::device_policy_name;
@@ -187,28 +187,16 @@ pub(super) fn record_wait_outcome(
             }
         },
     )?;
-    // Read once, not after an `exists()` check: a removal landing between the
-    // two would surface as a bare read error instead of the "removed" failure.
-    let settled = match written {
-        Some(latest) => {
-            *held = latest;
-            return Ok(());
+    // The record the guarded write refused is the one the message describes:
+    // it is not read a second time, so nothing can change between the decision
+    // and what is reported.
+    match written {
+        RecordUpdate::Written(latest) => {
+            *held = *latest;
+            Ok(())
         }
-        None => match ManagedServiceRecord::read_manifest(paths, &held.service_id) {
-            Ok(settled) => Some(settled),
-            Err(error)
-                if error
-                    .downcast_ref::<rocm_core::ManagedServiceNotFound>()
-                    .is_some() =>
-            {
-                None
-            }
-            Err(error) => return Err(error),
-        },
-    };
-    match settled {
-        Some(settled) => {
-            *held = settled;
+        RecordUpdate::NotOwned(settled) => {
+            *held = *settled;
             // A stop leaves its marker; anything else that settled the record
             // (the liveness refresh demoting a dead engine, or the engine's own
             // `failed`) means the server exited on its own, and the user needs
@@ -230,7 +218,7 @@ pub(super) fn record_wait_outcome(
                 service_hints::service_logs_hint(&held.service_id)
             );
         }
-        None => bail!(
+        RecordUpdate::Gone => bail!(
             "managed service `{}` was removed while `rocm serve` waited for it, so there is \
              no record of it left to report",
             held.service_id
