@@ -50,8 +50,8 @@ const BENCH_RING_CAP: usize = rocm_dash_core::bench_schema::BENCH_HISTORY_CAP;
 /// * a sticky directory (such as `/tmp`) is never chmodded, whoever owns it,
 ///   and is used when root or this user owns it;
 /// * any other directory owned by another user is refused;
-/// * one this user owns is restricted to `0o700` when group or others may
-///   write in it, and otherwise left as it is.
+/// * one this user owns is restricted to `0o700` when group or others have
+///   any access to it, and otherwise (`0o700`, `0o500`) left as it is.
 ///
 /// One daemon owns a socket path at a time (see `SocketClaim`): this returns
 /// [`SocketInUse`] at once, removing or replacing nothing at the socket path,
@@ -95,7 +95,8 @@ enum SocketDirVerdict {
     /// A sticky directory others may write in, such as `/tmp`: use it as it
     /// is, and say so once the path is claimed.
     UseShared,
-    /// Ours, but others may write in it: restrict it to `0o700` first.
+    /// Ours, but group or others have some access to it: restrict it to
+    /// `0o700` first.
     Tighten,
     /// Another user controls it: refuse it.
     Refuse,
@@ -109,17 +110,18 @@ enum SocketDirVerdict {
 ///   entry's owner may remove or rename it, so our `0o600` socket and lock
 ///   cannot be replaced there. It is usable when root or this user owns it;
 ///   any other owner could remove our entries, so it is refused.
-/// * A directory **we own** is restricted to `0o700` only when group or others
-///   may write in it; a `0o755`, `0o740` or `0o500` one is left as it is.
+/// * A directory **we own** is restricted to `0o700` whenever group or others
+///   have any access to it (`mode & 0o077 != 0`), so a `0o755` or `0o740` one
+///   is tightened too; one they cannot reach at all, `0o700` or `0o500`, is
+///   left as it is, so no chmod repeats once it is private.
 /// * Any **other owner** means another local user controls the path (a
 ///   squatting attack), so it is refused.
 #[cfg(unix)]
 const fn socket_dir_verdict(dir_uid: u32, mode: u32, our_uid: u32) -> SocketDirVerdict {
-    let writable_by_others = mode & 0o022 != 0;
     if mode & 0o1000 != 0 {
         return if dir_uid != 0 && dir_uid != our_uid {
             SocketDirVerdict::Refuse
-        } else if writable_by_others {
+        } else if mode & 0o022 != 0 {
             SocketDirVerdict::UseShared
         } else {
             SocketDirVerdict::Use
@@ -127,7 +129,7 @@ const fn socket_dir_verdict(dir_uid: u32, mode: u32, our_uid: u32) -> SocketDirV
     }
     if dir_uid != our_uid {
         SocketDirVerdict::Refuse
-    } else if writable_by_others {
+    } else if mode & 0o077 != 0 {
         SocketDirVerdict::Tighten
     } else {
         SocketDirVerdict::Use
@@ -166,11 +168,11 @@ fn effective_uid() -> u32 {
 /// one is judged by what it resolves to, following symlinks -- the directory
 /// the socket and its lock would really be created in. Something that is not
 /// a directory is always refused, first; otherwise [`socket_dir_verdict`]
-/// decides. The only chmod is the one it asks for, on a directory of ours
-/// others may write in, so the claim never works in it while it is open to
-/// them; a directory already acceptable is left untouched, with no chmod and
-/// no warning, since a dashboard that does not own the daemon runs this
-/// several times a second.
+/// decides. The only chmod is the one it asks for, on a non-sticky directory
+/// of ours that group or others have any access to, so the claim never works
+/// in it while it is open to them, and logs that it did; a directory already
+/// acceptable is left untouched, with no chmod and no log line, since a
+/// dashboard that does not own the daemon runs this several times a second.
 #[cfg(unix)]
 fn check_socket_dir(parent: &std::path::Path, our_uid: u32) -> anyhow::Result<bool> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -211,6 +213,16 @@ fn check_socket_dir(parent: &std::path::Path, our_uid: u32) -> anyhow::Result<bo
                     )
                 },
             )?;
+            // Once per directory: it is private from now on, so later checks
+            // leave it alone. `info`, not `warn`: the policy did what it is
+            // for, and nothing failed; the dashboard's default log filter
+            // (`DEFAULT_FILTER` in `apps/rocm/src/logging.rs`) keeps this
+            // crate's info lines.
+            info!(
+                dir = %parent.display(),
+                from = format_args!("{:04o}", meta.mode() & 0o7777),
+                "restricted socket directory to mode 0700"
+            );
             Ok(false)
         }
         SocketDirVerdict::Refuse => Err(anyhow!(unsecurable_socket_dir_context(parent))),
@@ -708,12 +720,13 @@ async fn serve_unix(
 ) -> anyhow::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     // The lock file lives in the socket's directory, so that directory has to
-    // exist, be one another user does not control, and not be writable by
-    // others if it is ours, before the claim creates, opens or probes anything
-    // in it. The check changes nothing in a directory that is already
-    // acceptable: a dashboard that is not the owner retries several times a
-    // second. The warning for a shared sticky directory waits until the path
-    // is claimed, so it is given once per daemon rather than per attempt.
+    // exist, be one another user does not control, and be private (no group
+    // or other access, see `socket_dir_verdict`) if it is ours and not sticky,
+    // before the claim creates, opens or probes anything in it. The check
+    // changes nothing in a directory that is already acceptable: a dashboard
+    // that is not the owner retries several times a second. The warning for a
+    // shared sticky directory waits until the path is claimed, so it is given
+    // once per daemon rather than per attempt.
     let shared = match parent {
         Some(parent) => check_socket_dir(parent, seams.our_uid)?,
         None => false,
@@ -1033,11 +1046,13 @@ mod tests {
             ),
             (1000, 0o777, 1000, Tighten, "ours, anyone may write"),
             (1000, 0o775, 1000, Tighten, "ours, group may write"),
-            (1000, 0o755, 1000, Use, "ours, others may only read"),
-            (1000, 0o740, 1000, Use, "ours, group may only read"),
+            (1000, 0o755, 1000, Tighten, "ours, others may read"),
+            (1000, 0o740, 1000, Tighten, "ours, group may read"),
+            (1000, 0o701, 1000, Tighten, "ours, others may search"),
             (1000, 0o500, 1000, Use, "ours, read-only"),
             (1000, 0o700, 1000, Use, "ours, private"),
-            (0, 0o755, 0, Use, "root's own directory, as root"),
+            (0, 0o755, 0, Tighten, "root's own directory, as root"),
+            (0, 0o700, 0, Use, "root's own private directory, as root"),
             (1001, 0o700, 1000, Refuse, "another user's directory"),
             (
                 1001,
@@ -1068,6 +1083,40 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
+    /// A directory of ours that others may read but not write, the common
+    /// `0o755`, is tightened to 0700 too, and the change is logged with the
+    /// directory and its old mode; a second check, of the now private
+    /// directory, logs nothing.
+    #[test]
+    fn tightens_owned_preexisting_parent() {
+        let captured = Captured::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(captured.clone())
+                .finish(),
+        );
+        let log = || String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("loose");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        check_socket_dir(&parent, effective_uid()).expect("should tighten a directory we own");
+
+        assert_eq!(mode_bits(&parent), 0o700);
+        let line = log();
+        assert!(
+            line.contains("restricted socket directory to mode 0700")
+                && line.contains(&format!("dir={}", parent.display()))
+                && line.contains("from=0755"),
+            "{line}"
+        );
+        check_socket_dir(&parent, effective_uid()).expect("checking it again is fine");
+        assert_eq!(log(), line, "nothing more is logged once it is private");
+    }
+
     /// A missing nested parent is created, at mode 0700.
     #[test]
     fn creates_missing_parent_at_0700() {
@@ -1081,15 +1130,18 @@ mod tests {
         );
     }
 
-    /// A directory of ours others may write in is restricted to 0700; one they
-    /// may only read, or not even that, is left exactly as it is.
+    /// A directory of ours that group or others have any access to is
+    /// restricted to 0700; one they cannot reach at all is left exactly as it
+    /// is.
     #[test]
-    fn only_a_socket_directory_others_may_write_is_tightened() {
+    fn only_a_socket_directory_others_can_reach_is_tightened() {
         let tmp = tempfile::tempdir().unwrap();
         for (mode, after) in [
             (0o777, 0o700),
             (0o775, 0o700),
-            (0o755, 0o755),
+            (0o750, 0o700),
+            (0o701, 0o700),
+            (0o700, 0o700),
             (0o500, 0o500),
         ] {
             let parent = tmp.path().join(format!("dir-{mode:o}"));
@@ -2052,9 +2104,9 @@ mod tests {
         let _ = daemon.await;
     }
 
-    /// An existing socket directory this user owns that others may write in is
-    /// restricted to `0o700` when the daemon serves it, and the socket to
-    /// `0o600`.
+    /// An existing socket directory this user owns that group or others have
+    /// any access to is restricted to `0o700` when the daemon serves it, and
+    /// the socket to `0o600`.
     #[tokio::test]
     async fn serving_restricts_a_socket_directory_it_owns() {
         let dir = tempfile::tempdir().unwrap();
@@ -2187,9 +2239,10 @@ mod tests {
         assert!(!real.join("rocmdashd.sock.lock").exists());
     }
 
-    /// A socket directory of ours that others may write in is made private
-    /// before the claim; checking an acceptable directory again changes
-    /// nothing -- a mode set between the two checks survives the second.
+    /// A socket directory of ours that group or others have any access to is
+    /// made private before the claim; checking an acceptable directory again
+    /// changes nothing -- a private mode set between the two checks survives
+    /// the second.
     #[test]
     fn a_loose_socket_directory_of_ours_is_made_private_before_the_claim() {
         let dir = tempfile::tempdir().unwrap();
@@ -2206,15 +2259,16 @@ mod tests {
             0,
             "the check creates nothing"
         );
-        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         super::check_socket_dir(&socket_dir, super::effective_uid())
             .expect("checking an acceptable directory again is fine");
-        assert_eq!(mode_of(&socket_dir), 0o750, "no chmod the second time");
+        assert_eq!(mode_of(&socket_dir), 0o500, "no chmod the second time");
     }
 
-    /// At the call site: a directory of ours others may write in is already
-    /// private by the time the claim works in it. Here the claim then fails
-    /// (a symlink sits at the lock path), and the directory is 0700 anyway.
+    /// At the call site: a directory of ours that group or others have any
+    /// access to is already private by the time the claim works in it. Here
+    /// the claim then fails (a symlink sits at the lock path), and the
+    /// directory is 0700 anyway.
     #[tokio::test]
     async fn a_loose_socket_directory_is_tightened_before_the_claim_runs() {
         let dir = tempfile::tempdir().unwrap();

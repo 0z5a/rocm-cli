@@ -1370,6 +1370,16 @@ Expected result:
   reported when, by the time the dashboard closes, another dashboard's daemon
   serves the socket -- except a crash of the dashboard's own supervision of
   its telemetry daemon, which is always reported.
+- A `unix:` socket path set in `dashboard.tui.connect` in `config.json` has
+  its directory restricted to mode `0700` when you own that directory and it
+  is not sticky (a sticky one such as `/tmp` keeps its mode), so point it at
+  a dedicated directory, not `$HOME` or one you share. To see it:
+  `d=$(mktemp -d); chmod 755 "$d"`, set `dashboard.tui.connect` to
+  `unix:$d/rocmdashd.sock` (with `$d` expanded), open and quit `rocm dash`,
+  then `stat -c %a "$d"` prints `700` and the day's `rocm-cli.log.<date>`
+  file holds one `restricted socket directory to mode 0700` line naming `$d`
+  and `from=0755`; opening it again adds no such line. Restore the setting
+  and `rm -r "$d"` afterwards.
 
 ## 5. Reuse Is Exempt From The No-GPU Refusal
 

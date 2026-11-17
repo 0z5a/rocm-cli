@@ -4432,10 +4432,12 @@ is created in it and never chmodded
 `a_symlink_to_another_users_socket_directory_is_refused`) -- these inject a fake
 uid for the daemon through `ServeSeams::our_uid`, since a test cannot make a
 directory another user really owns; real cross-uid ownership is not exercised --
-a missing socket directory created private, and only a writable one of ours
-tightened, before the claim, with no chmod on a second check
+a missing socket directory created private, and one of ours that group or
+others have any access to (a `0o755` one included) tightened, before the claim,
+with no chmod on a second check
 (`creates_missing_parent_at_0700`,
-`only_a_socket_directory_others_may_write_is_tightened`,
+`only_a_socket_directory_others_can_reach_is_tightened`,
+`tightens_owned_preexisting_parent`,
 `serving_creates_a_missing_socket_directory_privately`,
 `serving_restricts_a_socket_directory_it_owns`,
 `a_loose_socket_directory_of_ours_is_made_private_before_the_claim`,
@@ -4497,9 +4499,12 @@ second (`a_daemon_that_keeps_stopping_soon_after_serving_backs_off`), the
 backoff starting over after a run that served long enough
 (`a_run_that_served_long_enough_starts_the_backoff_over`), a daemon that served
 and then stopped reported as having stopped
-(`a_daemon_that_served_and_then_stopped_is_reported_as_stopped`), and a
+(`a_daemon_that_served_and_then_stopped_is_reported_as_stopped`), a
 replaced socket claimed again one poll later
-(`a_replaced_socket_is_claimed_again_after_one_poll_without_a_failure`). All of
+(`a_replaced_socket_is_claimed_again_after_one_poll_without_a_failure`), and a
+socket in use tried again 250 ms later when another daemon holds its lock and
+5 s later when something without the lock answers there
+(`a_socket_in_use_is_tried_again_after_its_holders_poll`). All of
 these are unix only. The dashboard's own side of a reconnect, holding each
 benchmark row once, is `benchmark_rows_are_held_once_across_a_reconnect` in
 [app/mod.rs](../crates/rocm-dash-tui/src/app/mod.rs), which calls

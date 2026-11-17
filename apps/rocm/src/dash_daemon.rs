@@ -484,8 +484,8 @@ mod tests {
     use super::{
         FAILURE_BACKOFF_MAX, KEEPER_WARNING, Keeper, KeeperFailure, NextStep,
         REPORT_COULD_NOT_START, REPORT_LOG_LINE, REPORT_STOPPED_SERVING, Ready, Retry,
-        SERVED_LONG_ENOUGH, UNLOCKED_LISTENER_POLL, failure_report, next_step, spawn_keeper, start,
-        start_with, stop_keeper,
+        SERVED_LONG_ENOUGH, TAKEOVER_POLL, UNLOCKED_LISTENER_POLL, failure_report, next_step,
+        spawn_keeper, start, start_with, stop_keeper,
     };
     use rocm_dash_daemon::server::NOT_A_SOCKET;
 
@@ -1154,6 +1154,8 @@ mod tests {
         ServeThenStop(Duration, &'static str),
         /// Serve, then find the socket taken from it at once.
         Replaced,
+        /// Find the socket in use by this holder, without serving.
+        InUse(rocm_dash_daemon::server::SocketHolder),
     }
 
     type RunFuture =
@@ -1189,6 +1191,9 @@ mod tests {
                     Some(Run::Replaced) => {
                         ready();
                         Err(rocm_dash_daemon::server::SocketReplaced { path }.into())
+                    }
+                    Some(Run::InUse(holder)) => {
+                        Err(rocm_dash_daemon::server::SocketInUse { path, holder }.into())
                     }
                 }
             }) as RunFuture
@@ -1342,6 +1347,31 @@ mod tests {
         assert_eq!(gaps(&started), [POLL]);
         assert_eq!(recorded(&keeper), None);
         assert!(!log.text().contains(KEEPER_WARNING), "{}", log.text());
+        assert_eq!(stop_keeper(keeper).await, None);
+    }
+
+    /// A socket another daemon holds the lock on is tried again after one
+    /// takeover poll, and one something without the lock answers at only
+    /// after the slower poll; neither is recorded as a failure.
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_in_use_is_tried_again_after_its_holders_poll() {
+        use rocm_dash_daemon::server::SocketHolder::{LockHolder, UnlockedListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let (serve, started) = scripted(
+            &path,
+            vec![Run::InUse(LockHolder), Run::InUse(UnlockedListener)],
+        );
+        let keeper = start_with(&path, TAKEOVER_POLL, serve);
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        assert_eq!(
+            gaps(&started),
+            [Duration::from_millis(250), Duration::from_secs(5)]
+        );
+        assert_eq!(recorded(&keeper), None);
         assert_eq!(stop_keeper(keeper).await, None);
     }
 
