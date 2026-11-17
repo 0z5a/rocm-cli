@@ -305,16 +305,18 @@ fn serve_with_transport(
         if record_path.exists() {
             // A record `load_all` refuses is invisible to `stop`, so pointing at
             // `stop` for it would be the same provably failing advice as for a
-            // lone key. The refusal names the file and carries the remedy for
-            // its own reason — under root, to run as the record's owner rather
-            // than to remove it — so nothing is added here that could
-            // contradict it.
+            // lone key. The refusal names the file and why it was refused, and
+            // for a foreign owner, a `remote_cli` this tool never writes or a
+            // misnamed file also how to clear it (under root, to run as the
+            // record's owner rather than to remove it), so no remedy is added
+            // here that could contradict it. A record that cannot be read or
+            // parsed, or whose id breaks the id rules, carries none.
             if let Err(refusal) = session::read_recorded(paths, &session_id) {
                 bail!(
                     "a session record for {} on port {} is on this machine, but it cannot be \
                      used: {refusal:#}\n\
-                     `rocm remote stop` cannot reach a record it refuses. Or serve on another \
-                     port with `--remote-port`.",
+                     `rocm remote stop` cannot reach a record it refuses. To serve on this \
+                     machine without clearing it, use another port with `--remote-port`.",
                     request.target,
                     request.remote_port,
                 );
@@ -2607,6 +2609,37 @@ mod tests {
         path
     }
 
+    /// Only `remote_cli` is pinned when a record is read, because it is the one
+    /// field placed unquoted into the remote command. The machine name is not
+    /// vetted there: it is checked where it becomes an ssh argument, and a
+    /// record naming an ssh option instead of a machine is refused at that
+    /// point, before ssh runs.
+    #[test]
+    fn a_record_naming_an_ssh_option_as_its_machine_never_reaches_ssh() {
+        let (root, paths) = temp_paths("target-option");
+        let mut record = sample_record();
+        record.target = "-oProxyCommand=touch /tmp/unexpected".to_owned();
+        record.write(&paths).unwrap();
+        let mut aliased = sample_record();
+        aliased.session_id = "remote-other-box-11434".to_owned();
+        aliased.target = "user@-oProxyCommand=true".to_owned();
+        aliased.write(&paths).unwrap();
+
+        let loaded = session::load_all(&paths).unwrap();
+        assert_eq!(loaded.records.len(), 2);
+        for record in &loaded.records {
+            let refusal = SshTransport::new(&record.target, record.ssh_port)
+                .err()
+                .unwrap_or_else(|| panic!("{:?} reached ssh as a destination", record.target))
+                .to_string();
+            assert!(
+                refusal.contains("would be read as an option by ssh"),
+                "{refusal}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A refused record is a session this machine started and may still be
     /// serving, so `status` must not say there are none. What it prints is
     /// computed from what `load_all` returned, and asserted against it.
@@ -2620,17 +2653,17 @@ mod tests {
         let printed = status_report(&paths, &loaded, |_| unreachable!("nothing to observe"));
         assert!(
             !printed.contains("No remote sessions have been started"),
-            "a refused record is not the absence of a session: {printed}"
+            "a refused record is not the absence of a session"
         );
         assert!(
             printed.contains("1 remote session record(s) were refused")
                 && printed.contains(&path.display().to_string())
                 && printed.contains("may still be serving"),
-            "{printed}"
+            "the listing must count and name the refused record"
         );
         assert!(
             !printed.contains("rocm remote stop"),
-            "`stop` cannot reach a refused record, so it must not be offered: {printed}"
+            "`stop` cannot reach a refused record, so it must not be offered"
         );
 
         // With nothing refused, the empty listing is still the plain one.
@@ -2639,7 +2672,7 @@ mod tests {
         let printed = status_report(&paths, &loaded, |_| unreachable!("nothing to observe"));
         assert!(
             printed.contains("No remote sessions have been started"),
-            "{printed}"
+            "with nothing refused the empty listing is the plain one"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2775,11 +2808,15 @@ mod tests {
             server: ServerHealth::Unreachable,
             publish: publish::PublishObservation::Unreachable("not probed in a test".to_owned()),
         });
-        assert!(printed.contains("remote-other-box-11434"), "{printed}");
+        // The messages leave the listing out: it is asserted on, not shown.
+        assert!(
+            printed.contains("remote-other-box-11434"),
+            "the usable session must be listed"
+        );
         assert!(
             printed.contains("1 remote session record(s) were refused")
                 && printed.contains(&refused.display().to_string()),
-            "{printed}"
+            "the refused record must be counted and named beside it"
         );
         let _ = std::fs::remove_dir_all(root);
     }

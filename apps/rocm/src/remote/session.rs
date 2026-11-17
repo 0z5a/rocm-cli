@@ -90,15 +90,36 @@ impl RemoteSessionRecord {
     /// id carrying `..` or a separator would make [`Self::path`] resolve outside
     /// the sessions directory — and `stop` deletes that path.
     ///
-    /// Deliberately delegating to [`rocm_core::ServiceId`] rather than spelling
-    /// the rules again here. It is the type the endpoint-key path builder
-    /// documents as its contract, this record's id is passed straight to that
-    /// builder, and a second hand-written rule set is exactly how the two drift
-    /// into disagreeing about what is safe.
+    /// The path rules are [`rocm_core::ServiceId`]'s rather than spelled again
+    /// here: it is the type the endpoint-key path builder documents as its
+    /// contract, this record's id is passed straight to that builder, and a
+    /// second hand-written rule set is how the two would drift apart.
+    ///
+    /// On top of those, the id must use only the characters [`Self::id_for`]
+    /// has ever written: lowercase ASCII letters, digits and `-`. The id is
+    /// printed in listings and in `rocm remote stop <id>` advice, so a format
+    /// character (a bidi override, a zero-width space), a line separator, a
+    /// space or a quote in it would change what the terminal shows or make
+    /// the printed command wrong, and none of them can come from `serve`.
     fn validate_id(session_id: &str) -> Result<()> {
         rocm_core::ServiceId::new(session_id)
             .map(|_| ())
+            .and_then(|()| {
+                if session_id.chars().all(Self::is_id_char) {
+                    Ok(())
+                } else {
+                    bail!(
+                        "it holds a character other than a lowercase ASCII letter, a digit or \
+                         `-`, which this tool never writes in a session id"
+                    )
+                }
+            })
             .with_context(|| format!("unusable remote session id {session_id:?}"))
+    }
+
+    /// A character [`Self::id_for`] may write into an id.
+    const fn is_id_char(character: char) -> bool {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
     }
 
     /// Refuse a `remote_cli` this code would never have written.
@@ -288,6 +309,17 @@ fn claim_existing_dir(directory: &Path, owner: u32) -> Result<()> {
         );
     }
     if target.mode() & 0o077 != 0 {
+        // A link is the user's own choice of where the records live, and
+        // `set_permissions` would change the directory it points at, which may
+        // be used for something else. Say what to do rather than doing it.
+        if link.file_type().is_symlink() {
+            bail!(
+                "it is a link to a directory that group or other users can access, and \
+                 session records and their credentials must be readable by you alone. \
+                 Restrict the directory it points at with `chmod 700`, or replace the link \
+                 with a directory of your own"
+            );
+        }
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to restrict {} to its owner", directory.display()))?;
     }
@@ -503,9 +535,12 @@ impl LoadedSessions {
     /// One sentence for `status` and `resolve`, which would otherwise report
     /// "no sessions" or "no such session", or `None` when nothing was refused.
     ///
-    /// It gives no remedy of its own: each refused record's warning, printed as
-    /// it was loaded, carries the remedy for its own reason, and a second one
-    /// here could contradict it — under root, for one. Nor does it say to run
+    /// It gives no remedy of its own. Each refused record's warning, printed as
+    /// it was loaded, says why it was refused, and for a foreign owner, a
+    /// `remote_cli` this tool never writes or a misnamed file it also says how
+    /// to clear it; a generic remedy here could contradict those (under root,
+    /// for one). A record that cannot be read or parsed, or whose id breaks the
+    /// id rules, carries no remedy of its own. Nor does this say to run
     /// `rocm remote stop`, which cannot reach a refused record.
     pub(crate) fn refused_summary(&self) -> Option<String> {
         if self.refused.is_empty() {
@@ -626,7 +661,21 @@ pub(crate) fn shown_path(path: &Path) -> String {
 /// would delete a file other than the one it read.
 fn read_one(path: &Path, owner: Option<u32>) -> Result<RemoteSessionRecord> {
     let mut file =
-        fs::File::open(path).with_context(|| format!("failed to read {}", shown_path(path)))?;
+        open_record(path).with_context(|| format!("failed to read {}", shown_path(path)))?;
+    // Checked on the opened file, so the file checked is the file read. A FIFO
+    // or a device named `*.json` would otherwise block `status` and `uninstall`
+    // on the read.
+    if !file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", shown_path(path)))?
+        .is_file()
+    {
+        bail!(
+            "refusing to act on {}: it is not a regular file. Remove it; a session record \
+             is a JSON file `rocm remote serve` writes",
+            shown_path(path)
+        );
+    }
     // Ownership is a unix check only; on Windows the records sit in the
     // per-user profile and `owner` is always `None`.
     #[cfg(unix)]
@@ -656,6 +705,23 @@ fn read_one(path: &Path, owner: Option<u32>) -> Result<RemoteSessionRecord> {
     RemoteSessionRecord::validate_remote_cli(&record.remote_cli)
         .with_context(|| format!("refusing to act on {}", shown_path(path)))?;
     Ok(record)
+}
+
+/// Open a record for reading without waiting on it.
+///
+/// On unix the open is non-blocking, because opening a FIFO for reading
+/// otherwise waits for a writer that may never come; [`read_one`] then refuses
+/// anything that is not a regular file before reading. Windows has no FIFOs a
+/// plain path open can block on.
+fn open_record(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
 }
 
 /// Refuse a record, or a link to one, that `owner` does not own.
@@ -696,10 +762,13 @@ fn check_owner(path: &Path, file: &fs::File, owner: u32) -> Result<()> {
 /// them may be the session the user meant; and a fragment that matches a
 /// refused record's file name as well as a usable session is refused as
 /// ambiguous, naming both, rather than resolved to the usable one. Only the
-/// file name is compared, since a refused record's contents are not trusted:
-/// a record `serve` wrote is named after its peer name and port, so a target
-/// or peer name counts, but a refused record renamed to something else does
-/// not.
+/// file name is compared, since a refused record's contents are not trusted.
+/// A record `serve` wrote is named after its peer name and port, so the peer
+/// name, or a target that is part of it, counts. A target that is not part of
+/// the peer name — an ssh alias, an IP address — matches the usable record
+/// and never a refused one, and neither does any name for a refused record
+/// renamed to something else; for those, only the exact session id is
+/// certain to name the session meant.
 pub(crate) fn resolve(paths: &AppPaths, needle: &str) -> Result<RemoteSessionRecord> {
     let loaded = load_all(paths)?;
     let refused = loaded
@@ -1114,6 +1183,45 @@ mod tests {
             assert_eq!(loaded.refused, vec![path]);
         }
 
+        // On every platform: an id `serve` could not have written, filed under
+        // its own name so only the id rules can refuse it. A format character,
+        // a line separator, a space or an uppercase letter is no path hazard,
+        // but each changes what a listing or a printed `stop` command shows.
+        for (n, id) in [
+            "remote-gpu-box\u{202e}-11434",
+            "remote-gpu-box\u{2028}-11434",
+            "remote-gpu-box\u{200b}-11434",
+            "remote-gpu box-11434",
+            "Remote-Gpu-Box-11434",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = sample("gpu-box.example-tailnet.ts.net", 11434);
+            record.session_id = id.to_owned();
+            fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+            let path = paths.remote_sessions_dir().join(format!("{id}.json"));
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let refusal = format!("{:#}", read_one(&path, None).unwrap_err());
+            assert!(
+                refusal.contains("unusable remote session id")
+                    && refusal.contains("never writes in a session id"),
+                "case {n}: {refusal:?}"
+            );
+            for raw in ['\u{202e}', '\u{2028}', '\u{200b}'] {
+                assert!(!refusal.contains(raw), "case {n}: {refusal:?}");
+            }
+            fs::remove_file(&path).unwrap();
+        }
+        // Every id `serve` writes passes.
+        assert!(
+            RemoteSessionRecord::validate_id(&RemoteSessionRecord::id_for(
+                "GPU-Box.Example-Tailnet.ts.net",
+                11434
+            ))
+            .is_ok()
+        );
+
         // On every platform: `..` is a legal file name, so a record can be filed
         // under an id holding it, and only the id rules refuse it.
         let mut dotted = sample("gpu-box.example-tailnet.ts.net", 11434);
@@ -1312,7 +1420,9 @@ mod tests {
     fn a_refused_record_says_which_file_and_why() {
         let (root, paths) = temp_paths("refusal-reason");
         let mut record = sample("gpu-box.example-tailnet.ts.net", 11434);
-        record.remote_cli = "rocm\u{1b}[2J; touch /tmp/unexpected #".to_owned();
+        // An escape sequence, a bidi override and a line separator: each would
+        // change what the terminal shows if it reached it raw.
+        record.remote_cli = "rocm\u{1b}[2J\u{202e}x\u{2028}y; touch /tmp/unexpected #".to_owned();
         // `write` does not vet the record; only reading does.
         record.write(&paths).unwrap();
         let path = record.path(&paths);
@@ -1326,11 +1436,91 @@ mod tests {
             refusal.contains("unexpected remote CLI"),
             "says why: {refusal}"
         );
-        assert!(
-            !refusal.contains('\u{1b}'),
-            "a control character from the file reached the message: {refusal:?}"
-        );
+        for raw in ['\u{1b}', '\u{202e}', '\u{2028}'] {
+            assert!(
+                !refusal.contains(raw),
+                "{raw:?} from the file reached the message: {refusal:?}"
+            );
+        }
         assert!(load_all(&paths).unwrap().records.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A FIFO named like a record must not block the listing: opening one for
+    /// reading waits for a writer, and `status` and `uninstall` both read
+    /// every `*.json` in the directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_is_not_a_regular_file_is_refused_without_blocking() {
+        let (root, paths) = temp_paths("fifo-record");
+        fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+        let fifo = paths
+            .remote_sessions_dir()
+            .join("remote-gpu-box-11434.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader_paths = paths;
+        std::thread::spawn(move || {
+            let _ = sender.send(load_all(&reader_paths).map(|loaded| loaded.refused));
+        });
+        let refused = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("load_all blocked on a FIFO named like a record")
+            .unwrap();
+        assert_eq!(refused, vec![fifo.clone()]);
+        let refusal = format!("{:#}", read_one(&fifo, None).unwrap_err());
+        assert!(refusal.contains("not a regular file"), "{refusal}");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A sessions directory reached through a link is the user's own choice of
+    /// where records live. A loose one is refused rather than tightened, so
+    /// the directory the link points at is not changed behind the user's back;
+    /// an owner-only one is used as it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_sessions_directory_is_not_tightened_through_the_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (root, paths) = temp_paths("linked-dir");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        let directory = paths.remote_sessions_dir();
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &directory).unwrap();
+
+        let refusal = format!("{:#}", ensure_sessions_dir(&paths).unwrap_err());
+        assert!(
+            refusal.contains("is a link to a directory that group or other users can access")
+                && refusal.contains("chmod 700"),
+            "{refusal}"
+        );
+        assert_eq!(
+            mode_of(&elsewhere),
+            0o755,
+            "the linked directory was changed"
+        );
+
+        // Following the advice clears it, and the link is then used as it is.
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_sessions_dir(&paths).unwrap();
+        sample("gpu-box.example-tailnet.ts.net", 11434)
+            .write(&paths)
+            .unwrap();
+        assert_eq!(load_all(&paths).unwrap().records.len(), 1);
+        assert!(
+            fs::symlink_metadata(&directory)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
 
         let _ = fs::remove_dir_all(root);
     }
