@@ -50,9 +50,10 @@ pub(crate) const PIPED_SERVE_STATUS_BUDGET: Duration = Duration::from_secs(45);
 
 /// Endpoint not listing the model and no meaningful log line.
 ///
-/// As long as [`SILENT_LOAD`]: a start that has written nothing yet (a slow
-/// pre-spawn step, such as a container engine pulling its image without a
-/// progress line) is given no less time than a quiet load.
+/// As long as [`SILENT_LOAD`]: a start that has written no meaningful line
+/// to its log yet (a slow step before the engine logs anything) is given no
+/// less time than a quiet load. Pinned by
+/// `a_start_with_no_log_gets_as_long_as_a_quiet_load`.
 pub(crate) const SILENT_UNREACHABLE: Duration = SILENT_LOAD;
 
 /// A load line that stops changing while the endpoint has not listed the model.

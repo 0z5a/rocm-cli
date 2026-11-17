@@ -180,7 +180,8 @@ pub(crate) fn start_managed_service(
     // the endpoint got, as for any other launch: `running` only when the model
     // is listed, `starting` when it never opened, so `rocm services`, dash and
     // chat do not show a server that has not listed its model as up.
-    // `rocmd` leaves a live `starting` record alone until the startup deadline.
+    // `rocmd` leaves a live `starting` record alone until the startup deadline
+    // (`live_startup_still_in_progress` in apps/rocmd/src/watchers/server_recover.rs).
     let launch_status = status_for_readiness(readiness);
     let recorded = record_wait_outcome(
         paths,
