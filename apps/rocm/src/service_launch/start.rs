@@ -65,6 +65,7 @@ pub(crate) fn start_managed_service(
     let steady = ServeStartupView {
         phase: ServeStartupPhase::Unreachable,
         label: serve_progress::starting_label(requested_model, engine),
+        log_line: None,
     };
     #[cfg(feature = "e2e-oom-fault-injection")]
     if e2e_simulate_oom_launch() {

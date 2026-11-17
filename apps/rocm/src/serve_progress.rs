@@ -49,7 +49,11 @@ pub(crate) const DOWNLOAD_STALL: Duration = Duration::from_mins(3);
 pub(crate) const PIPED_SERVE_STATUS_BUDGET: Duration = Duration::from_secs(45);
 
 /// Endpoint not listing the model and no meaningful log line.
-pub(crate) const SILENT_UNREACHABLE: Duration = Duration::from_mins(2);
+///
+/// As long as [`SILENT_LOAD`]: a start that has written nothing yet (a slow
+/// pre-spawn step, such as a container engine pulling its image without a
+/// progress line) is given no less time than a quiet load.
+pub(crate) const SILENT_UNREACHABLE: Duration = SILENT_LOAD;
 
 /// A load line that stops changing while the endpoint has not listed the model.
 pub(crate) const SILENT_LOAD: Duration = Duration::from_mins(5);
@@ -237,6 +241,10 @@ pub(crate) enum ServeStartupPhase {
 pub(crate) struct ServeStartupView {
     pub phase: ServeStartupPhase,
     pub label: String,
+    /// The engine-log line `label` shows, when it shows one. Set where the
+    /// label is chosen, so a stop quotes the engine only when the label is
+    /// its line, never one of this module's own fallback labels.
+    pub log_line: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +359,13 @@ fn line_is_download(line: &str) -> bool {
     lower.contains("download") || lower.contains("fetching ") || lower.contains("pulling ")
 }
 
+/// A download line still in progress. One whose last percent is 100 is a
+/// finished download: what follows is loading, so a quiet engine after it
+/// is judged by the load limit, not the download stall.
+fn line_is_active_download(line: &str) -> bool {
+    line_is_download(line) && last_percent(line) != Some("100")
+}
+
 /// Last `NN%` in the line, so a bar whose ETA keeps moving but whose percent
 /// does not is still stalled.
 fn download_fingerprint(line: &str) -> String {
@@ -386,7 +401,7 @@ fn progress_token(readiness: EndpointReadiness, signals: &ServeStartupSignals) -
     if let Some(line) = signals
         .log_line
         .as_deref()
-        .filter(|line| line_is_download(line))
+        .filter(|line| line_is_active_download(line))
     {
         return format!("download:{}", download_fingerprint(line));
     }
@@ -413,12 +428,14 @@ fn classify(
         return ServeStartupView {
             phase: ServeStartupPhase::Failed,
             label,
+            log_line: signals.log_line.clone(),
         };
     }
     if readiness == EndpointReadiness::Serving {
         return ServeStartupView {
             phase: ServeStartupPhase::Serving,
             label: starting_label(model, engine),
+            log_line: None,
         };
     }
     // Listing wins over a stale download line. vLLM advertises the model
@@ -431,43 +448,35 @@ fn classify(
                 .log_line
                 .clone()
                 .unwrap_or_else(|| waiting_label(model)),
+            log_line: signals.log_line.clone(),
         };
     }
     if let Some(line) = signals
         .log_line
         .as_ref()
-        .filter(|line| line_is_download(line))
+        .filter(|line| line_is_active_download(line))
     {
         return ServeStartupView {
             phase: ServeStartupPhase::Downloading,
             label: line.clone(),
+            log_line: Some(line.clone()),
         };
     }
     if let Some(line) = &signals.log_line {
         return ServeStartupView {
             phase: ServeStartupPhase::Loading,
             label: line.clone(),
+            log_line: Some(line.clone()),
         };
     }
     ServeStartupView {
         phase: ServeStartupPhase::Unreachable,
         label: starting_label(model, engine),
-    }
-}
-
-fn quoted_log(model: &str, engine: &str, view: &ServeStartupView) -> Option<String> {
-    if view.label == starting_label(model, engine) || view.label == waiting_label(model) {
-        return None;
-    }
-    match view.label.as_str() {
-        "the engine reported failed" | "the server process exited" => None,
-        _ => Some(view.label.clone()),
+        log_line: None,
     }
 }
 
 fn stop_decision(
-    model: &str,
-    engine: &str,
     view: &ServeStartupView,
     reason: ServeStartupStopReason,
     process_alive: bool,
@@ -476,7 +485,7 @@ fn stop_decision(
     ServeStartupDecision::Stop(ServeStartupStop {
         phase: view.phase,
         reason,
-        log_line: quoted_log(model, engine, view),
+        log_line: view.log_line.clone(),
         label: view.label.clone(),
         process_alive,
         readiness,
@@ -502,8 +511,6 @@ pub(crate) fn decide_serve_startup(
 
     if signals.engine_failed {
         return stop_decision(
-            model,
-            engine,
             &view,
             ServeStartupStopReason::EngineFailed,
             process_alive,
@@ -512,8 +519,6 @@ pub(crate) fn decide_serve_startup(
     }
     if !process_alive {
         return stop_decision(
-            model,
-            engine,
             &view,
             ServeStartupStopReason::ProcessExited,
             process_alive,
@@ -526,8 +531,6 @@ pub(crate) fn decide_serve_startup(
     if timing.elapsed >= policy.bounds.deadline {
         return if policy.stop_on_give_up {
             stop_decision(
-                model,
-                engine,
                 &view,
                 ServeStartupStopReason::Deadline,
                 process_alive,
@@ -541,8 +544,6 @@ pub(crate) fn decide_serve_startup(
         && timing.since_progress >= policy.bounds.download_stall
     {
         return stop_decision(
-            model,
-            engine,
             &view,
             ServeStartupStopReason::DownloadStalled,
             process_alive,
@@ -553,8 +554,6 @@ pub(crate) fn decide_serve_startup(
         && timing.since_progress >= policy.bounds.silent_unreachable
     {
         return stop_decision(
-            model,
-            engine,
             &view,
             ServeStartupStopReason::Silent,
             process_alive,
@@ -565,8 +564,6 @@ pub(crate) fn decide_serve_startup(
         && timing.since_progress >= policy.bounds.silent_load
     {
         return stop_decision(
-            model,
-            engine,
             &view,
             ServeStartupStopReason::SilentLoad,
             process_alive,
@@ -1114,6 +1111,94 @@ mod tests {
         ));
         assert_eq!(view.phase, ServeStartupPhase::Listing);
         assert_eq!(view.label, "Loading safetensors checkpoint shards: 80%");
+    }
+
+    /// A download line at 100% is a finished download: a quiet engine after
+    /// it is loading, so the download stall must not fire at 3 minutes; the
+    /// load limit decides, at 5.
+    /// A start with no log line yet is not held to a shorter limit than a
+    /// quiet load: neither has shown a hang the other has not.
+    #[test]
+    fn a_start_with_no_log_gets_as_long_as_a_quiet_load() {
+        assert!(SILENT_UNREACHABLE >= SILENT_LOAD);
+        let just_under = SILENT_LOAD.as_millis() as u64 - 1_000;
+        assert_continue(decide_serve_startup(
+            "qwen",
+            "aim",
+            EndpointReadiness::Unreachable,
+            &alive(),
+            at(just_under, just_under),
+            &interactive(),
+        ));
+    }
+
+    #[test]
+    fn a_finished_download_line_is_judged_as_loading() {
+        let line = "Downloading model.safetensors: 100%";
+        let mut signals = alive();
+        signals.log_line = Some(line.to_owned());
+        let past_download_stall = DOWNLOAD_STALL.as_millis() as u64 + 1_000;
+        let view = assert_continue(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(past_download_stall + 1_000, past_download_stall),
+            &interactive(),
+        ));
+        assert_eq!(view.phase, ServeStartupPhase::Loading);
+        assert_eq!(view.log_line.as_deref(), Some(line));
+        let past_load = SILENT_LOAD.as_millis() as u64 + 1_000;
+        let stop = assert_stop(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(past_load + 1_000, past_load),
+            &interactive(),
+        ));
+        assert_eq!(stop.reason, ServeStartupStopReason::SilentLoad);
+        // An unfinished percent is still a download.
+        signals.log_line = Some("Downloading model.safetensors: 99%".to_owned());
+        let stop = assert_stop(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(past_download_stall + 1_000, past_download_stall),
+            &interactive(),
+        ));
+        assert_eq!(stop.reason, ServeStartupStopReason::DownloadStalled);
+    }
+
+    /// A stop quotes the engine only when its label is the engine's line,
+    /// decided where the label is chosen: an engine line that happens to read
+    /// like one of the fallback labels is still quoted, and a fallback label
+    /// is never quoted.
+    #[test]
+    fn a_stop_quotes_the_engine_line_not_a_fallback_label() {
+        let mut signals = alive();
+        signals.process_alive = false;
+        let stop = assert_stop(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(1_000, 1_000),
+            &interactive(),
+        ));
+        assert_eq!(stop.label, "the server process exited");
+        assert_eq!(stop.log_line, None);
+        signals.log_line = Some("the server process exited".to_owned());
+        let stop = assert_stop(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(1_000, 1_000),
+            &interactive(),
+        ));
+        assert_eq!(stop.log_line.as_deref(), Some("the server process exited"));
     }
 
     #[test]
@@ -1757,6 +1842,8 @@ mod tests {
                 alive,
                 "{reason:?} alive={alive}: {message}"
             );
+            // True of rocmd: `a_failed_record_with_a_live_process_is_still_recovered`
+            // in apps/rocmd/src/watchers/server_recover.rs.
             assert_eq!(
                 message.contains("may restart it first"),
                 alive,

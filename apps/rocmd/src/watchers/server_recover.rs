@@ -843,6 +843,52 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// An engine that reported `failed` while its process is still up is a
+    /// recovery candidate: no liveness guard covers `failed`. This is what the
+    /// interactive serve's engine-failed message warns about when it says a
+    /// running daemon with `server-recover` may restart the server first
+    /// (`only_a_stall_or_the_deadline_leaves_the_server_running` in
+    /// apps/rocm/src/serve_progress.rs pins that sentence).
+    #[test]
+    fn a_failed_record_with_a_live_process_is_still_recovered() -> Result<()> {
+        let (root, paths) = temp_app_paths("recoverable-failed-live");
+        paths.ensure()?;
+        let mut failed = ManagedServiceRecord::new(
+            &paths,
+            "svc-failed-live",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            free_loopback_port(),
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        failed.status = "failed".to_owned();
+        failed.created_at_unix_ms = unix_time_millis();
+        failed.write()?;
+        let found = find_recoverable_service(&paths)?;
+        let event = service_record_matches_recovery_event(
+            &paths,
+            &failed,
+            &recovery_event(&failed, "service.manifest_recoverable"),
+        );
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            found.map(|(record, reason)| (record.service_id, reason)),
+            Some((
+                "svc-failed-live".to_owned(),
+                "manifest_status_failed".to_owned()
+            )),
+            "a live `failed` record inside the startup deadline is restarted"
+        );
+        assert!(event, "the event re-check authorizes the same restart");
+        Ok(())
+    }
+
     #[test]
     fn find_recoverable_service_prefers_failed_managed_manifest() -> Result<()> {
         let (root, paths) = temp_app_paths("recoverable-service");

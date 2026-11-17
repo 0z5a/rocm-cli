@@ -1261,8 +1261,8 @@ and a quick smoke test (time to first token and approximate tokens per
 second). A model that is still loading is not reported as a finished "not
 ready" summary. The wait fails, and `rocm serve` exits non-zero, when the
 engine reports failure or its process exits, when a download percent stops
-advancing for 3 minutes, when the endpoint has not listed the model and there is no engine log for
-2 minutes, when a load log line stops changing for 5 minutes with the endpoint
+advancing for 3 minutes (a line at 100% counts as loading), when the endpoint has not listed the model and there is no engine log for
+5 minutes, when a load log line stops changing for 5 minutes with the endpoint
 not yet listing the model, or after 30 minutes in all. A stall leaves the server running:
 the message names `rocm logs --service <service-id>` and
 `rocm services stop <service-id> --yes`, and the background helper does not

@@ -2218,8 +2218,8 @@ serve or that wait fails. A download that is still moving is not cut off at
 45 seconds, and a failure names `rocm logs --service <service-id>` and
 `rocm services stop <service-id> --yes` instead of printing
 `Deployment summary (not ready yet)`. The wait fails when the engine fails or
-exits, a download percent stops for 3 minutes (`DOWNLOAD_STALL`), the endpoint
-has not listed the model, with no log, for 2 minutes (`SILENT_UNREACHABLE`), a load line
+exits, a download percent below 100 stops for 3 minutes (`DOWNLOAD_STALL`; a line at 100% is judged as loading), the endpoint
+has not listed the model, with no log, for 5 minutes (`SILENT_UNREACHABLE`, equal to `SILENT_LOAD`), a load line
 stops changing for 5 minutes (`SILENT_LOAD`), or after 30 minutes
 (`rocm_core::SERVE_STARTUP_DEADLINE`). Engine log lines are masked of
 credentials before they are shown (`redact_log_line`). Once the endpoint lists the model,
