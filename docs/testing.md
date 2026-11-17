@@ -933,12 +933,15 @@ tear down, and refuse to publish over a Funnel-exposed port — and needs
 `cargo build -p rocm` first. It does not prove the endpoint carries traffic;
 that needs a real two-node tailnet.
 
-`remote-17` to `remote-20` cover what happens to a refused session record
+`remote-17` to `remote-22` cover what happens to a refused session record
 without a second machine: they plant the record on disk and check that
 `rocm remote status` counts it instead of reporting no sessions, that
 `rocm remote stop` names it and leaves it in place, that a record filed
-under another session's name is refused, and that `rocm remote serve` over a
-refused record names it instead of offering `stop`. `uninstall-16`
+under another session's name is refused, that `rocm remote serve` over a
+refused record names it instead of offering `stop`, and that
+`rocm remote stop` with a name matching both a usable and a refused record
+stops nothing and names both, whether the name is the short target name or the
+full peer name. `uninstall-16`
 (`features/uninstall.feature`) checks that a dry-run uninstall names a refused
 record. All of these run on every lane. The refusals of records and session
 directories owned by another user are unit-tested only, because a scenario

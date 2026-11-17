@@ -1685,8 +1685,11 @@ on Linux, if it is owned by another user. That includes running `rocm remote`
 under `sudo` against your own records: run it as the user who created the
 session. `status` with no session named counts refused records instead of
 reporting no sessions, since the model a refused record describes may still be
-running. `stop` cannot reach a refused record, and `serve` on the machine and
-port it names refuses with that record's warning instead of offering `stop`.
+running. `stop` cannot reach a refused record, and a session name that matches
+a refused record's file name as well as a usable session is refused as
+ambiguous rather than resolved to the usable one. `serve` on the machine and
+port a refused record names refuses with that record's warning instead of
+offering `stop`.
 Removing a record forgets the session but does not stop it on the machine.
 
 Communication with the machine uses your existing `ssh` setup. Set

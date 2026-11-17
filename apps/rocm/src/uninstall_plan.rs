@@ -188,7 +188,7 @@ pub(crate) fn build_uninstall_plan(
             loaded
                 .refused
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| crate::remote::session::shown_path(path))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -874,6 +874,38 @@ mod tests {
             "{warning}"
         );
         assert!(warning.is_ascii(), "{warning}");
+        Ok(())
+    }
+
+    /// The refused record's file name is whatever is in the directory, so the
+    /// warning shows it escaped rather than handing the terminal what it holds.
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_shows_a_refused_record_name_escaped() -> Result<()> {
+        let (root, paths) = test_paths("uninstall-refused-remote-session-escaped");
+        paths.ensure()?;
+        let directory = paths.remote_sessions_dir();
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join("remote-dev-box-\u{1b}[2J.json"), "{}")?;
+
+        let options = UninstallOptions {
+            dry_run: true,
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &options);
+        let _ = fs::remove_dir_all(&root);
+        let plan = plan?;
+
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("could not be used"))
+            .unwrap_or_else(|| panic!("a refused record must be warned about: {plan:#?}"));
+        assert!(
+            warning.contains("remote-dev-box-\\u{1b}[2J.json") && !warning.contains('\u{1b}'),
+            "{warning:?}"
+        );
         Ok(())
     }
 

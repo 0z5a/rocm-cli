@@ -176,3 +176,22 @@ Feature: Working with GPU machines over a private network
     When the user asks to serve a model on the GPU machine
     Then the user is told the session record cannot be used and `stop` cannot reach it
     And the session record is left in place
+
+  # A refused record is never picked, but it still counts when the user names a
+  # session by a fragment: it may be the one they meant, and resolving the name
+  # to the other session would stop a model nobody asked to stop. Both the short
+  # target name and the full peer name a user copies from the tailnet count,
+  # though the record's file name spells the peer name's dots as dashes.
+  @id:remote-stop-fragment-matching-a-refused-record-is-ambiguous
+  Scenario: remote-21 - Stopping by a name that also matches a refused record is refused and names both
+    Given a usable session record and a refused one for the same GPU machine
+    When the user asks to stop the session on that machine by the name "gpu-box"
+    Then the user is told "gpu-box" also matches the refused record
+    And both session records are left in place
+
+  @id:remote-stop-peer-name-matching-a-refused-record-is-ambiguous
+  Scenario: remote-22 - Stopping by the full peer name that also matches a refused record is refused and names both
+    Given a usable session record and a refused one for the same GPU machine
+    When the user asks to stop the session on that machine by the name "gpu-box.example-tailnet.ts.net"
+    Then the user is told "gpu-box.example-tailnet.ts.net" also matches the refused record
+    And both session records are left in place

@@ -803,6 +803,63 @@ async fn then_stop_names_refused(world: &mut E2eWorld) {
     );
 }
 
+/// The id `serve` gives a session on the fake tailnet's GPU machine at port
+/// 8000, planted usable beside a refused record for the same machine at the
+/// default port ([`GPU_BOX_SESSION_ID`]). Both carry the ids `serve` writes, so
+/// their file names spell the peer name as a real record's does.
+const USABLE_SESSION_ID: &str = "remote-gpu-box-example-tailnet-ts-net-8000";
+
+#[given("a usable session record and a refused one for the same GPU machine")]
+async fn given_usable_and_refused_records(world: &mut E2eWorld) {
+    plant_session_record(world, USABLE_SESSION_ID, USABLE_SESSION_ID, "rocm");
+    plant_session_record(
+        world,
+        GPU_BOX_SESSION_ID,
+        GPU_BOX_SESSION_ID,
+        "rocm; true #",
+    );
+}
+
+#[when(expr = "the user asks to stop the session on that machine by the name {string}")]
+async fn when_stop_by_machine_name(world: &mut E2eWorld, name: String) {
+    let env = world.remote_env.clone();
+    run_remote(world, &["remote", "stop", &name], &env);
+}
+
+#[then(expr = "the user is told {string} also matches the refused record")]
+async fn then_fragment_names_refused(world: &mut E2eWorld, name: String) {
+    let said = said(world);
+    let refused = sessions_dir(world).join(format!("{GPU_BOX_SESSION_ID}.json"));
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a name matching a refused record too must not be resolved:\n{said}"
+    );
+    assert!(
+        said.contains(&format!(
+            "`{name}` matches remote session {USABLE_SESSION_ID}, but that is not the only \
+             record it matches."
+        )) && said.contains(&format!(
+            "It also matches refused session record(s), which may be the session you meant \
+             (see the warnings above): {}",
+            refused.display()
+        )),
+        "the user must be told which records the name matches:\n{said}"
+    );
+}
+
+#[then("both session records are left in place")]
+async fn then_both_records_left(world: &mut E2eWorld) {
+    for id in [USABLE_SESSION_ID, GPU_BOX_SESSION_ID] {
+        let record = sessions_dir(world).join(format!("{id}.json"));
+        assert!(
+            record.exists(),
+            "an ambiguous stop must not forget either session: {} is gone",
+            record.display()
+        );
+    }
+}
+
 #[then("the session record is left in place")]
 async fn then_record_left(world: &mut E2eWorld) {
     // The one planted record is still there: `only_session_record` asserts

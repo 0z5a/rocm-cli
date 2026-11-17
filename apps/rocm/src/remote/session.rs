@@ -59,8 +59,14 @@ impl RemoteSessionRecord {
     /// invocation, which is what turns a repeated command into an idempotent
     /// action rather than a leak.
     pub(crate) fn id_for(peer_host: &str, remote_port: u16) -> String {
-        let host = peer_host
-            .chars()
+        format!("remote-{}-{remote_port}", Self::as_in_id(peer_host))
+    }
+
+    /// `text` as [`Self::id_for`] spells a host inside an id, and so inside a
+    /// record's file name: lowercase, with anything but ASCII letters, digits
+    /// and dashes turned into a dash.
+    fn as_in_id(text: &str) -> String {
+        text.chars()
             .map(|character| {
                 if character.is_ascii_alphanumeric() || character == '-' {
                     character.to_ascii_lowercase()
@@ -71,9 +77,9 @@ impl RemoteSessionRecord {
                     '-'
                 }
             })
-            .collect::<String>();
-        let host = host.trim_matches('-');
-        format!("remote-{host}-{remote_port}")
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned()
     }
 
     /// Check an id against the rules the rest of the CLI uses for anything that
@@ -92,7 +98,7 @@ impl RemoteSessionRecord {
     fn validate_id(session_id: &str) -> Result<()> {
         rocm_core::ServiceId::new(session_id)
             .map(|_| ())
-            .with_context(|| format!("unusable remote session id `{session_id}`"))
+            .with_context(|| format!("unusable remote session id {session_id:?}"))
     }
 
     /// Refuse a `remote_cli` this code would never have written.
@@ -511,7 +517,7 @@ impl LoadedSessions {
             self.refused.len(),
             self.refused
                 .iter()
-                .map(|path| path.display().to_string())
+                .map(|path| shown_path(path))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))
@@ -586,6 +592,24 @@ pub(crate) fn read_recorded(paths: &AppPaths, session_id: &str) -> Result<Remote
     read_one(&RemoteSessionRecord::path_in(paths, session_id), owner)
 }
 
+/// A record's path as it may be shown in a message: its file name is whatever
+/// is in the sessions directory, so a character that would drive the terminal
+/// (an escape sequence, a bidi override, a line break) is shown escaped, as the
+/// session id and remote CLI in a refusal are.
+pub(crate) fn shown_path(path: &Path) -> String {
+    let mut shown = String::new();
+    for c in path.display().to_string().chars() {
+        if rocm_core::terminal::is_control_or_format(c)
+            || rocm_core::terminal::is_control_or_line_separator(c)
+        {
+            shown.extend(c.escape_unicode());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
 /// Read and vet one record.
 ///
 /// When `owner` is given, the record must belong to that user. A record is a
@@ -602,35 +626,35 @@ pub(crate) fn read_recorded(paths: &AppPaths, session_id: &str) -> Result<Remote
 /// would delete a file other than the one it read.
 fn read_one(path: &Path, owner: Option<u32>) -> Result<RemoteSessionRecord> {
     let mut file =
-        fs::File::open(path).with_context(|| format!("failed to read {}", path.display()))?;
+        fs::File::open(path).with_context(|| format!("failed to read {}", shown_path(path)))?;
     // Ownership is a unix check only; on Windows the records sit in the
     // per-user profile and `owner` is always `None`.
     #[cfg(unix)]
     if let Some(owner) = owner {
         check_owner(path, &file, owner)
-            .with_context(|| format!("refusing to act on {}", path.display()))?;
+            .with_context(|| format!("refusing to act on {}", shown_path(path)))?;
     }
     #[cfg(not(unix))]
     let _ = owner;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut bytes)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+        .with_context(|| format!("failed to read {}", shown_path(path)))?;
     let record: RemoteSessionRecord = serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+        .with_context(|| format!("failed to parse {}", shown_path(path)))?;
     RemoteSessionRecord::validate_id(&record.session_id)
-        .with_context(|| format!("refusing to act on {}", path.display()))?;
+        .with_context(|| format!("refusing to act on {}", shown_path(path)))?;
     let filed_as = path.file_stem().and_then(|stem| stem.to_str());
     if filed_as != Some(record.session_id.as_str()) {
         bail!(
             "refusing to act on {}: it records session {:?} but is not named after it; \
              rename it to {:?} or remove it",
-            path.display(),
+            shown_path(path),
             record.session_id,
             format!("{}.json", record.session_id)
         );
     }
     RemoteSessionRecord::validate_remote_cli(&record.remote_cli)
-        .with_context(|| format!("refusing to act on {}", path.display()))?;
+        .with_context(|| format!("refusing to act on {}", shown_path(path)))?;
     Ok(record)
 }
 
@@ -639,11 +663,11 @@ fn read_one(path: &Path, owner: Option<u32>) -> Result<RemoteSessionRecord> {
 fn check_owner(path: &Path, file: &fs::File, owner: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
     let link = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .with_context(|| format!("failed to inspect {}", shown_path(path)))?
         .uid();
     let opened = file
         .metadata()
-        .with_context(|| format!("failed to inspect {}", path.display()))?
+        .with_context(|| format!("failed to inspect {}", shown_path(path)))?
         .uid();
     if let Some(found) = first_foreign_uid(&[link, opened], owner) {
         bail!(
@@ -669,7 +693,13 @@ fn check_owner(path: &Path, file: &fs::File, owner: u32) -> Result<()> {
 ///
 /// A refused record is never a match — it is not safe to act on. When nothing
 /// is recorded or nothing matches, the refused records are named, since one of
-/// them may be the session the user meant.
+/// them may be the session the user meant; and a fragment that matches a
+/// refused record's file name as well as a usable session is refused as
+/// ambiguous, naming both, rather than resolved to the usable one. Only the
+/// file name is compared, since a refused record's contents are not trusted:
+/// a record `serve` wrote is named after its peer name and port, so a target
+/// or peer name counts, but a refused record renamed to something else does
+/// not.
 pub(crate) fn resolve(paths: &AppPaths, needle: &str) -> Result<RemoteSessionRecord> {
     let loaded = load_all(paths)?;
     let refused = loaded
@@ -700,6 +730,35 @@ pub(crate) fn resolve(paths: &AppPaths, needle: &str) -> Result<RemoteSessionRec
                 || session.session_id.to_ascii_lowercase().contains(&lowered)
         })
         .collect::<Vec<_>>();
+    // A refused record is matched by its file name, the one part of it that
+    // can be read without trusting its contents. It is never picked, but a
+    // fragment it matches is not unambiguous: it may be the session meant.
+    // The name a user types is a target or a peer name, which the file name
+    // spells as `id_for` does (`gpu-box.example.ts.net` as `gpu-box-example-
+    // ts-net`), so the fragment is compared in that spelling too.
+    let as_in_id = RemoteSessionRecord::as_in_id(needle);
+    let refused_matches = loaded
+        .refused
+        .iter()
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_ascii_lowercase)
+                // A name that spells to nothing (`.`, `-`) would match every
+                // file name; it says nothing about which record was meant.
+                .is_some_and(|stem| !as_in_id.is_empty() && stem.contains(&as_in_id))
+        })
+        .map(|path| shown_path(path))
+        .collect::<Vec<_>>();
+    let refused_also = if refused_matches.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nIt also matches refused session record(s), which may be the session you meant \
+             (see the warnings above): {}",
+            refused_matches.join(", ")
+        )
+    };
 
     match matches.as_slice() {
         [] => bail!(
@@ -710,9 +769,14 @@ pub(crate) fn resolve(paths: &AppPaths, needle: &str) -> Result<RemoteSessionRec
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        [only] => Ok((*only).clone()),
+        [only] if refused_also.is_empty() => Ok((*only).clone()),
+        [only] => bail!(
+            "`{needle}` matches remote session {}, but that is not the only record it matches.{refused_also}\n\
+             Name the session exactly to act on it.",
+            only.session_id
+        ),
         several => bail!(
-            "`{needle}` matches more than one remote session: {}\n\
+            "`{needle}` matches more than one remote session: {}{refused_also}\n\
              Name one of them exactly.",
             several
                 .iter()
@@ -1010,22 +1074,76 @@ mod tests {
         // traversal would make the record's path resolve outside the sessions
         // directory — and `stop` deletes that path.
         let (root, paths) = temp_paths("unsafe-id");
-        let mut record = sample("gpu-box.example-tailnet.ts.net", 11434);
-        record.session_id = "../../escaped".to_owned();
-        fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
-        fs::write(
-            paths.remote_sessions_dir().join("planted.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        // Filed under its own id, so the file-name check passes and only the id
+        // check can refuse it. A traversal cannot be planted that way — it is
+        // not a file name — so this uses the other class the id rules refuse.
+        // Such a name cannot exist on Windows, which is why this part is unix.
+        #[cfg(unix)]
+        {
+            let mut record = sample("gpu-box.example-tailnet.ts.net", 11434);
+            record.session_id = "remote-gpu-box\u{1b}[2J-11434".to_owned();
+            fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+            let path = paths
+                .remote_sessions_dir()
+                .join(format!("{}.json", record.session_id));
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
 
-        // Skipped like any other unreadable record: the rest stay visible.
-        sample("other-box.example-tailnet.ts.net", 11434)
-            .write(&paths)
-            .unwrap();
-        let loaded = load_all(&paths).unwrap().records;
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].peer_host, "other-box.example-tailnet.ts.net");
+            let refusal = format!("{:#}", read_one(&path, None).unwrap_err());
+            assert!(
+                refusal.contains("unusable remote session id")
+                    && refusal.contains("control characters"),
+                "refused by the id rules, and says so: {refusal:?}"
+            );
+            // The id came from the file and is printed in the warning, so it
+            // is shown escaped, like the remote CLI in the test below.
+            assert!(
+                !refusal.contains('\u{1b}'),
+                "a control character from the file reached the message: {refusal:?}"
+            );
+
+            // Skipped like any other unreadable record: the rest stay visible.
+            sample("other-box.example-tailnet.ts.net", 11434)
+                .write(&paths)
+                .unwrap();
+            let loaded = load_all(&paths).unwrap();
+            assert_eq!(loaded.records.len(), 1);
+            assert_eq!(
+                loaded.records[0].peer_host,
+                "other-box.example-tailnet.ts.net"
+            );
+            assert_eq!(loaded.refused, vec![path]);
+        }
+
+        // On every platform: `..` is a legal file name, so a record can be filed
+        // under an id holding it, and only the id rules refuse it.
+        let mut dotted = sample("gpu-box.example-tailnet.ts.net", 11434);
+        dotted.session_id = "remote-gpu..box-11434".to_owned();
+        fs::create_dir_all(paths.remote_sessions_dir()).unwrap();
+        let dotted_path = paths
+            .remote_sessions_dir()
+            .join(format!("{}.json", dotted.session_id));
+        fs::write(&dotted_path, serde_json::to_vec(&dotted).unwrap()).unwrap();
+        let refusal = format!("{:#}", read_one(&dotted_path, None).unwrap_err());
+        assert!(
+            refusal.contains("unusable remote session id") && refusal.contains("`..`"),
+            "{refusal}"
+        );
+
+        // An id carrying a traversal cannot be a file name, so it sits under
+        // another name; the id rules, which run first, refuse it all the same.
+        let mut traversal = sample("gpu-box.example-tailnet.ts.net", 11434);
+        traversal.session_id = "../../escaped".to_owned();
+        let planted = paths.remote_sessions_dir().join("planted.json");
+        fs::write(&planted, serde_json::to_vec(&traversal).unwrap()).unwrap();
+        let refusal = format!("{:#}", read_one(&planted, None).unwrap_err());
+        assert!(refusal.contains("unusable remote session id"), "{refusal}");
+        assert!(
+            load_all(&paths)
+                .unwrap()
+                .records
+                .iter()
+                .all(|record| record.session_id != "../../escaped")
+        );
 
         // The rules come from the shared service-id type, so a traversal, a
         // separator or an empty id is refused with a message naming the rule.
@@ -1074,6 +1192,111 @@ mod tests {
             unknown.contains("Recorded sessions"),
             "an unmatched name should list what does exist: {unknown}"
         );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// A refused record is not a candidate, but it still counts against a
+    /// fragment: it may be the session the user meant, and picking the one
+    /// usable match instead would `stop` a model nobody asked to stop.
+    #[test]
+    fn a_fragment_that_also_matches_a_refused_record_is_refused() -> Result<()> {
+        let (root, paths) = temp_paths("ambiguous-refused");
+        let usable = sample("gpu-box.example-tailnet.ts.net", 8000);
+        usable.write(&paths)?;
+        let mut refused = sample("gpu-box.example-tailnet.ts.net", 11434);
+        refused.remote_cli = "not-a-cli-this-tool-writes".to_owned();
+        refused.write(&paths)?;
+
+        // By the short target name, and by the peer name a user copies from
+        // the tailnet, whose dots the file name spells as dashes.
+        for name in ["gpu-box", "GPU-Box.Example-Tailnet.ts.net"] {
+            let error = resolve(&paths, name).unwrap_err().to_string();
+            assert!(error.contains(&usable.session_id), "{name}: {error}");
+            assert!(
+                error.contains(&refused.path(&paths).display().to_string()),
+                "{name}: names the refused record: {error}"
+            );
+        }
+
+        // The exact id of the usable session is still unambiguous, and a
+        // fragment matching only the usable one still resolves to it — including
+        // one that spells to nothing in a file name, which matches no record.
+        assert_eq!(resolve(&paths, &usable.session_id)?, usable);
+        assert_eq!(resolve(&paths, "8000")?, usable);
+        assert_eq!(resolve(&paths, ".")?, usable);
+        let mut other = sample("other-box.example-tailnet.ts.net", 8000);
+        other.target = "other".to_owned();
+        other.write(&paths)?;
+        let only_by_dot = resolve(&paths, ".").unwrap_err().to_string();
+        assert!(
+            only_by_dot.contains("matches more than one remote session")
+                && !only_by_dot.contains("refused"),
+            "a dot matches both usable sessions and no file name: {only_by_dot}"
+        );
+
+        // Several usable matches and a refused one: all of them are named.
+        let error = resolve(&paths, "box").unwrap_err().to_string();
+        assert!(
+            error.contains(&usable.session_id)
+                && error.contains(&other.session_id)
+                && error.contains(&refused.path(&paths).display().to_string()),
+            "{error}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn a_shown_path_escapes_what_would_drive_the_terminal() {
+        let shown = shown_path(Path::new(
+            "/data/remote-sessions/a\u{1b}[2J-b\u{202e}c\nd\u{2028}e.json",
+        ));
+        assert_eq!(
+            shown,
+            "/data/remote-sessions/a\\u{1b}[2J-b\\u{202e}c\\u{a}d\\u{2028}e.json"
+        );
+        assert_eq!(
+            shown_path(Path::new("/data/remote-sessions/remote-gpu-box-11434.json")),
+            "/data/remote-sessions/remote-gpu-box-11434.json"
+        );
+    }
+
+    /// A refused record's file name is whatever is in the directory, and every
+    /// message that lists refused records shows it escaped — the summary
+    /// `status` prints and the ambiguity `resolve` reports. The uninstall
+    /// warning has its own test in `uninstall_plan`.
+    #[cfg(unix)]
+    #[test]
+    fn refused_record_names_are_shown_escaped_wherever_they_are_listed() -> Result<()> {
+        let (root, paths) = temp_paths("escaped-names");
+        sample("gpu-box.example-tailnet.ts.net", 8000).write(&paths)?;
+        let planted = paths
+            .remote_sessions_dir()
+            .join("remote-gpu-box-\u{1b}[2J.json");
+        fs::write(
+            &planted,
+            serde_json::to_vec(&sample("gpu-box.example-tailnet.ts.net", 11434))?,
+        )?;
+
+        let loaded = load_all(&paths)?;
+        assert_eq!(loaded.refused, vec![planted]);
+        let summary = loaded.refused_summary().unwrap();
+        assert!(
+            summary.contains("remote-gpu-box-\\u{1b}[2J.json"),
+            "{summary:?}"
+        );
+        assert!(!summary.contains('\u{1b}'), "{summary:?}");
+
+        let error = resolve(&paths, "gpu-box").unwrap_err().to_string();
+        assert!(
+            error.contains("It also matches refused session record(s)")
+                && error.contains("remote-gpu-box-\\u{1b}[2J.json"),
+            "{error:?}"
+        );
+        assert!(!error.contains('\u{1b}'), "{error:?}");
 
         let _ = fs::remove_dir_all(root);
         Ok(())
