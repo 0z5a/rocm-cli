@@ -2,9 +2,9 @@ Feature: Model serving
 
   # Interactive `rocm serve` (a terminal, not --verbose or --foreground) follows
   # download, load, and health on the status line until the server is ready or
-  # the startup wait fails. Scenario serve-59 drives it under a real PTY; it
+  # the startup wait fails. Scenario serve-61 drives it under a real PTY; it
   # needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes
-  # only. serve-60 covers an engine that exits during startup on the no-GPU
+  # only. serve-62 covers an engine that exits during startup on the no-GPU
   # mock lane with a stand-in engine. The stall, deadline and engine-failed
   # branches need a controllable engine, so no lane reaches them; `decide_serve_startup` and
   # `wait_for_serve_startup` in apps/rocm/src/serve_progress.rs are their
@@ -27,7 +27,7 @@ Feature: Model serving
   # This discriminates nothing yet: the scenario is an expected failure on every
   # host while its xfail row stands, and the vLLM run stops before printing a
   # plan, so the step panics there whatever the lemonade half did. It becomes
-  # regression coverage when that row is narrowed. serve-55 and the unit tests in
+  # regression coverage when that row is narrowed. serve-60 and the unit tests in
   # serve_cmd.rs are what hold the per-engine refs in the meantime.
   @id:serve-short-name-consistent-across-engines
   Scenario: serve-02 - Every engine expands a short name rather than serving it
@@ -383,8 +383,8 @@ Feature: Model serving
   # E2E_INCLUDE_NIGHTLY is set (nightly.yml, or an include_nightly dispatch of
   # e2e-selfhosted.yml) on a host that has Docker and a supported GPU.
   # On a host without Docker both skip (the nightly job logs whether Docker is
-  # reachable). serve-27's known failure on Strix Halo Ubuntu is an xfail row in
-  # expectations.toml, tracked in rocm-cli#1058.
+  # reachable). serve-27's stop failure on Strix Halo Ubuntu (rocm-cli#1058)
+  # passed on the 2026-11-15 and 2026-11-16 nightlies, so its xfail row is gone.
   # `@serve-timeout:1200`
   # widens both the harness's readiness poll and the CLI's own
   # ROCM_CLI_AIM_READY_TIMEOUT_SECS (see isolate_cmd) — a cold-start HF weight
@@ -951,19 +951,58 @@ Feature: Model serving
     When the user stops the scenario's managed Lemonade service
     Then the managed service is stopped and its endpoint is closed
 
+  # A served endpoint's API key sits in `<data>/services/<id>.endpoint-key`, and
+  # nobody but the user who started the server may read it. Here: a loopback
+  # serve with `--require-api-key` (so no public port is opened on the GPU box),
+  # then the key file's mode is checked to be exactly 0600. The file is replaced
+  # by a freshly created owner-only one on every store, so a mode loosened in
+  # place is tightened again; that re-store case is covered by the unit tests in
+  # `endpoint_keys.rs` and `rocm-core`'s `atomic_write.rs`, since a stop deletes
+  # the key before a restart writes it back. The check does not depend on
+  # readiness: the serve waits a fixed 45 seconds for the engine
+  # (`READINESS_WAIT` in `service_launch/readiness.rs`) and then exits 0,
+  # reporting a server still loading as `starting`; the key is written before
+  # the engine starts, and the scenario's teardown stops the service.
+  # Linux-only: on Windows the key is protected by an owner-only DACL
+  # instead, but the Windows GPU lane serves with Lemonade, which refuses a
+  # key-protected bind there (`ensure_public_bind_engine_supported` in
+  # `service_launch/endpoint_auth.rs`), so the Windows half is covered by the
+  # `rocm-core` unit tests that read the DACL back on the Windows build job.
+  @id:serve-endpoint-key-readable-by-owner-only @requires-gpu @requires-os:linux
+  Scenario: serve-59 - Only the user who started a key-protected server can read its key
+    Given a managed runtime is active
+    When the user serves a model that requires an API key
+    Then the server's API key is kept where only that user can read it
+
+  # A launch that became ready but whose first chat request fails must not be
+  # shown as a healthy deployment (#523). Same test-only hook as
+  # @id:serve-oom-launch-memory-guidance, in its
+  # `ready` mode, pointed at a mock engine that fails every chat request. The
+  # unit and provider tests prove the rendering and the failure classes; this
+  # proves `serve()` carries the smoke test's failure into the summary.
+  @id:serve-smoke-failure-summary @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-60 - A launch whose first chat request fails is not presented as ready
+    Given a managed vLLM launch that becomes ready but whose engine fails its first chat request
+    When the user opens the interactive serve summary against that engine
+    Then the deployment summary says the smoke test failed and does not call the service ready
+    And the deployment summary gives the engine's own reason
+    And the engine received exactly one chat request
+    And the deployment summary names the logs command for that service
+    And the launch's service record is left as ready
+
   # Interactive `rocm serve` under a real terminal: while it waits it names the
   # command that follows the engine's log, then it exits 0 once the endpoint
   # lists the model. The named command is run, not just read: a hint that
   # points at a command that does not work would still pass a string check.
   @id:serve-interactive-startup-progress @requires-gpu
-  Scenario: serve-59 - Interactive serve shows how to follow startup and exits when the model is served
+  Scenario: serve-61 - Interactive serve shows how to follow startup and exits when the model is served
     Given a managed runtime is active
     When the user serves a model on GPU under a real terminal
     Then the terminal names the command that follows the server's log
     And the named log command runs successfully
     And the serve exits cleanly and the endpoint lists the model
 
-  # The failure side of serve-59, on the mock lane. A real engine cannot start on
+  # The failure side of serve-61, on the mock lane. A real engine cannot start on
   # a host with no GPU, so the `e2e-oom-fault-injection` build swaps the managed
   # child for a stand-in that writes one log line and exits during startup
   # (`ROCM_E2E_SIMULATE_STARTUP_EXIT`); the record, the log, the startup wait and
@@ -972,7 +1011,7 @@ Feature: Model serving
   # lanes. The log command the failure names is run, and the record is checked,
   # so the message cannot claim a log or a settled launch that is not there.
   @id:serve-startup-exit-names-log @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-60 - An engine that exits during interactive startup fails the serve and names its log
+  Scenario: serve-62 - An engine that exits during interactive startup fails the serve and names its log
     Given a managed engine will exit while it starts
     When the user serves a model with that engine under a real terminal
     Then the serve fails saying the server process exited

@@ -1373,6 +1373,7 @@ mod tests {
             status: "starting".to_owned(),
             already_running: false,
             metrics: crate::serve_summary::SmokeMetrics::default(),
+            smoke_failure: None,
             api_key: None,
             notes: Vec::new(),
         };
