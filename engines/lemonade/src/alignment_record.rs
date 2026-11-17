@@ -113,6 +113,11 @@ impl AlignmentFailure {
     /// Whether the alignment should be skipped now: the same attempt (target,
     /// pin and Lemonade version) failed less than [`ALIGNMENT_RETRY_AFTER`] ago.
     ///
+    /// The record is not keyed on the rocm-cli version: this engine cannot see
+    /// the per-release version today, so a rocm-cli upgrade does not clear the
+    /// record. It expires after [`ALIGNMENT_RETRY_AFTER`], and
+    /// [`RETRY_ALIGNMENT_COMMAND`] clears it sooner.
+    ///
     /// A failure time later than `now` (the clock moved back) does not skip:
     /// trying again costs an install, and a record whose age cannot be known
     /// must not stop the alignment indefinitely.
@@ -152,6 +157,31 @@ impl AlignmentFailure {
             ago = describe_ago(age),
             pinned = self.pinned_rocm_version,
             when = describe_from_now(remaining),
+        )
+    }
+
+    /// The context added to the error when the record skipped the alignment and
+    /// preparing the pinned backend then failed. That preparation can fail before
+    /// anything is installed (no free port, `lemond` not starting or not
+    /// answering, the backend listing, no supported GPU backend) and Lemonade may
+    /// pick a backend other than ROCm, so the line claims neither an install nor
+    /// a backend kind. It says what [`RETRY_ALIGNMENT_COMMAND`] does -- re-extract
+    /// the runtime tree without the record, so it tries the alignment again and
+    /// downloads the backend again -- and not that it fixes the error beneath,
+    /// which may be transient, or that it avoids the pinned backend, which a
+    /// failing alignment reverts to.
+    pub(crate) fn skipped_install_failure(&self, now: SystemTime) -> String {
+        // Called only after `skips_alignment` said yes for this `now`, which needs a
+        // known age, so the default is never taken.
+        let age = self.age(now).unwrap_or_default();
+        format!(
+            "preparing Lemonade's llama.cpp backend as pinned for ROCm {pinned} failed; the \
+             alignment to ROCm {target} was skipped because it failed {ago}. \
+             `{RETRY_ALIGNMENT_COMMAND}` re-extracts the runtime tree without that record, \
+             so it tries the alignment again (downloading the backend again)",
+            pinned = self.pinned_rocm_version,
+            target = self.target_rocm_version,
+            ago = describe_ago(age),
         )
     }
 }

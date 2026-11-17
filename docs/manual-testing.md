@@ -504,6 +504,14 @@ then `rocm engines install lemonade`. Expected result:
   that an install run 24 hours from now or later tries it again, and exits 0.
 - Running the first command again attempts the alignment again (the warning
   is back), because `--reinstall` removed the record with the runtime tree.
+- Not a manual step: when preparing the pinned backend fails on the second
+  install, its error says so, that the alignment was skipped because of the
+  earlier failure, and that `rocm engines install lemonade --reinstall`
+  re-extracts the runtime tree without that record; the record is kept and the
+  skip line above is not printed. There is no way to make that install fail on
+  demand, so this is covered by the unit test
+  `a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`
+  in [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs).
 
 To check what a Lemonade install says about its size (no download needed for
 the refusal): with a debug build, set

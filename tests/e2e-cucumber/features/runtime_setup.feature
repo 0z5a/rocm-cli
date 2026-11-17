@@ -728,7 +728,8 @@ Feature: Runtime configuration
   # The first install here is the failure; the second is the one under test.
   # The failure is remembered for 24 hours; the unit tests in
   # engines/lemonade/src/backend_alignment.rs cover expiry, another ROCm
-  # version, an unreadable record and the opt-out.
+  # version, an unreadable record, a failed install
+  # after the skip, and the opt-out.
   #
   # Technical details: the version the alignment targets is overridden to
   # 7.99.0 through the `rocm/e2e-test-hooks` variable

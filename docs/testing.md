@@ -2678,25 +2678,31 @@ cargo test -p rocm-engine-lemonade a_skipped_alignment_whose_install_fails
 The tests are in
 [alignment_record.rs](../engines/lemonade/src/alignment_record.rs) and
 [backend_alignment.rs](../engines/lemonade/src/backend_alignment.rs), one per
-state of the record: none, one that skips the alignment (the regression test:
-the second install calls no alignment tier and installs without forcing, and its
-notice is asserted with the pin file), one for another ROCm version, one 24
-hours old, an unreadable one, one that cannot be written, one that cannot be
-removed after a later successful alignment, one removed by a later successful
-alignment, one removed by `--reinstall`
-(`reinstall_removes_the_record_of_a_failed_alignment` in
-[install.rs](../engines/lemonade/src/install.rs)), one the opt-out leaves alone,
-and a skipped alignment whose install fails (the error is reported and no notice
-is printed). The unreadable record has a row for each place it can be met: every
-install that returns before the record is consulted (the opt-out, an unsupported
-platform, no active ROCm version or a failed lookup of it, an unreadable pin,
-and a pin that already equals the active ROCm version) leaves it as it is and
-says nothing; one that gets past those checks removes it with a warning, whether
-the alignment then runs, the backend probe fails or the probe selects Vulkan;
-and when it cannot be removed, the warning carries the removal's own error and
-names `rocm engines install lemonade --reinstall`. Both a record that applies
-and an unreadable one are handled before the backend probe starts `lemond`; a
-revert whose install fails writes no record; and
+state of the record described in the section linked above, and their names say
+which: no record (`with_no_record_the_alignment_runs_as_before`), one that
+applies (the regression test,
+`a_failed_alignment_is_not_repeated_by_the_next_install_within_a_day`: the
+second install calls no alignment tier and installs without forcing, and its
+notice is asserted with the pin file), one that applies checked before the
+backend probe starts `lemond`
+(`a_record_that_applies_skips_before_the_backend_probe_runs`), one for another
+ROCm version, one a day old, one an early exit never consults (one table test,
+a row per exit, with an unreadable record on disk), an unreadable one past
+those exits (removed with a warning on every path: probe error, Vulkan and
+ROCm, in `an_unreadable_record_is_removed_with_one_warning_on_every_path`; and,
+on the ROCm-probe path only, the probe asserting from inside that the removal
+and warning came first, in
+`an_unreadable_record_is_removed_and_reported_before_the_backend_probe_runs`), one that cannot be removed either, one that cannot be written, one
+a later verified alignment removes, one that cannot be removed after that
+alignment, a revert whose install fails writing none (asserted in
+`align_revert_restores_the_backend_dir_when_the_fallback_install_fails`), the
+opt-out leaving one alone, and a skipped alignment whose install fails
+(`a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing`:
+its error chain asserted in three rows, `lemond` not starting, a transient
+failure and the backend retry's own advice, each with the kept record and no
+notice). Removal by `--reinstall` is
+`reinstall_removes_the_record_of_a_failed_alignment` in
+[install.rs](../engines/lemonade/src/install.rs), and
 `the_record_file_name_matches_the_one_the_e2e_steps_hard_code` reads the e2e
 steps' copy of the record's file name, so the two cannot drift. The scenario
 `runtime-lemonade-backend-alignment-failure-remembered` (runtime-33 in

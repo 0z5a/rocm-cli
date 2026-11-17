@@ -606,7 +606,11 @@ async fn assert_lemonade_record_cleared(world: &mut E2eWorld) {
 const UNPUBLISHED_ROCM_VERSION: &str = "7.99.0";
 
 /// The override applies to one command only (`run_rocm_with_scenario_env`
-/// consumes it), so each step that runs `rocm` sets it again first.
+/// consumes it). So the step that is about to run `rocm` either sets it itself
+/// or relies on an immediately preceding step having set it, and a step that
+/// runs `rocm` and is followed by another such step re-arms it after its own
+/// run: the reinstall Given does, for the shared `When the user installs the
+/// Lemonade engine`.
 fn target_unpublished_rocm_version(world: &mut E2eWorld) {
     world.command_env.push((
         "ROCM_E2E_LEMONADE_ALIGNMENT_TARGET_VERSION",

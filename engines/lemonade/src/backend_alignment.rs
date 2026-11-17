@@ -76,7 +76,10 @@ fn lemonade_backend_alignment_disabled() -> bool {
 /// ([`crate::alignment_record`]), and for the next
 /// [`ALIGNMENT_RETRY_AFTER`](crate::alignment_record::ALIGNMENT_RETRY_AFTER) the same
 /// alignment is not tried again: the backend already pinned is installed without
-/// forcing a reinstall, and a line says so and how to try again sooner.
+/// forcing a reinstall, and a line says so and how to try again sooner. If that
+/// fails, the error says the alignment was skipped because of the record and that
+/// `--reinstall` re-extracts the runtime tree without it, so it tries the
+/// alignment again.
 ///
 /// Returns the aligned version string when one was applied and verified, so the caller
 /// can surface it in the install response.
@@ -229,8 +232,11 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
             if failure.skips_alignment(&target_version, &pinned_version, &manifest.version, now) {
                 // Not forced: the backend the revert installed is the one wanted.
                 // The line is printed only once that install has succeeded, since
-                // it says the pinned backend is in use.
-                fallback_install(manifest, false)?;
+                // it says the pinned backend is in use. A failure says the record
+                // is why no alignment was tried, and how to remove it, whichever
+                // step of the install failed.
+                fallback_install(manifest, false)
+                    .with_context(|| failure.skipped_install_failure(now))?;
                 notice(failure.skip_notice(now));
                 return Ok(None);
             }
@@ -3260,32 +3266,77 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Preparing the skipped alignment's pinned backend fails: the error says so
+    /// without claiming an install ran or which backend, says why no alignment was
+    /// tried and what `--reinstall` does, and keeps the error beneath, whether that
+    /// is `lemond` not starting, a transient failure, or the backend retry's own
+    /// `--reinstall` advice. That `--reinstall` removes the record is
+    /// `reinstall_removes_the_record_of_a_failed_alignment` in `install.rs`; that
+    /// the next install then aligns is `with_no_record_the_alignment_runs_as_before`.
     #[test]
     fn a_skipped_alignment_whose_install_fails_reports_the_error_and_claims_nothing() {
-        let (dir, _) = runtime_dir_with_packaged_pin("record-skip-install-fails");
-        let failure = recorded_failure(RECORD_TARGET, FAILED_AT);
-        write_alignment_failure(&dir, &failure).unwrap();
+        const CONTEXT: &str = "preparing Lemonade's llama.cpp backend as pinned for ROCm \
+            7.13.0 failed; the alignment to ROCm 7.99.0 was skipped because it failed 1 hour \
+            ago. `rocm engines install lemonade --reinstall` re-extracts the runtime tree \
+            without that record, so it tries the alignment again (downloading the backend \
+            again)";
+        type Install = fn() -> Result<()>;
+        let rows: [(&str, Install, String); 3] = [
+            (
+                // The shape `spawn_lemond` returns: nothing was installed, and no
+                // backend kind is known yet.
+                "lemond does not start",
+                || {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                        .context("failed to start /opt/lemonade/bin/lemond")
+                },
+                format!("{CONTEXT}: failed to start /opt/lemonade/bin/lemond: entity not found"),
+            ),
+            (
+                "transient",
+                || bail!("timed out waiting for lemond to start"),
+                format!("{CONTEXT}: timed out waiting for lemond to start"),
+            ),
+            (
+                "the backend retry's own advice",
+                || {
+                    Err(anyhow!("backend download failed"))
+                        .context(crate::llamacpp_backend::BACKEND_INSTALL_RETRY_FAILED)
+                },
+                format!(
+                    "{CONTEXT}: {}: backend download failed",
+                    crate::llamacpp_backend::BACKEND_INSTALL_RETRY_FAILED
+                ),
+            ),
+        ];
+        for (label, install, chain) in rows {
+            let (dir, _) = runtime_dir_with_packaged_pin("record-skip-install-fails");
+            let failure = recorded_failure(RECORD_TARGET, FAILED_AT);
+            write_alignment_failure(&dir, &failure).unwrap();
 
-        let run = prepare_against_record(&dir, false, at(FAILED_AT + HOUR), || {
-            bail!("backend download failed")
-        });
+            let run = prepare_against_record(&dir, false, at(FAILED_AT + HOUR), install);
 
-        assert_eq!(
-            run.result.unwrap_err().to_string(),
-            "backend download failed"
-        );
-        assert_eq!(run.align_calls, 0);
-        assert_eq!(run.installs, [false]);
-        assert!(
-            run.notices.is_empty(),
-            "the notice says the pinned backend is in use, which it is not: {:?}",
-            run.notices
-        );
-        assert_eq!(
-            read_alignment_failure(&dir),
-            StoredAlignmentFailure::Recorded(failure)
-        );
-        fs::remove_dir_all(&dir).ok();
+            let error = run.result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                failure.skipped_install_failure(at(FAILED_AT + HOUR)),
+                "{label}"
+            );
+            assert_eq!(format!("{error:#}"), chain, "{label}");
+            assert_eq!(run.align_calls, 0, "{label}");
+            assert_eq!(run.installs, [false], "{label}");
+            assert!(
+                run.notices.is_empty(),
+                "{label}: the notice says the pinned backend is in use, which it is not: {:?}",
+                run.notices
+            );
+            assert_eq!(
+                read_alignment_failure(&dir),
+                StoredAlignmentFailure::Recorded(failure),
+                "{label}: the record is kept"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
