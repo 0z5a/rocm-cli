@@ -236,7 +236,18 @@ pub(crate) enum Command {
     /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
     /// marked that way today: a GPU ROCm has no runtime build for is a fact
     /// about the hardware, not something to put right).
-    /// Use `--dry-run` to see any fix's plan without changing anything.
+    /// Use `--dry-run` to see a fix's plan without changing anything.
+    ///
+    /// A fix whose command fails exits 4 and says why on stderr. A command that
+    /// does not finish within its time limit is stopped and also exits 4; the
+    /// change may then be partial, so the message names how to check it and the
+    /// `rocm fix` command to re-run. On Windows, `fix-2-unset-override`,
+    /// `fix-6-path` and `fix-9-igpu-dgpu --device-index N` read the current
+    /// value of the variable they change before planning; when that read
+    /// fails they stop before changing anything, with exit 4. Under
+    /// `--dry-run` they stop the same way and show no plan; the catalog entry
+    /// printed first is the fix's generic description, not a preview of the
+    /// change on this machine.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
@@ -247,7 +258,11 @@ pub(crate) enum Command {
         /// Fixes that only print steps never ask.
         #[arg(long)]
         yes: bool,
-        /// Show the plan without changing anything.
+        /// Show the plan without changing anything. On Windows, a dry run of a
+        /// fix that reads the current value of the variable it would change
+        /// stops with exit 4 and shows no plan when that read fails; the
+        /// catalog entry printed first is the fix's generic description, not a
+        /// preview of the change on this machine.
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
@@ -560,6 +575,9 @@ rocm serve qwen --verbose --device gpu_required")]
         #[arg(long, conflicts_with = "managed")]
         verbose: bool,
         /// Skip the post-startup inference smoke test (time-to-first-token, tokens/sec).
+        ///
+        /// When the smoke test runs and cannot complete, the summary says so
+        /// and does not report the service as ready; ROCm CLI does not stop the server.
         #[arg(long)]
         no_smoke_test: bool,
         /// Allow binding to a non-local address.
@@ -981,7 +999,17 @@ rocm engines install vllm --reinstall")]
 #[derive(Subcommand, Debug)]
 pub(crate) enum RuntimesCommand {
     /// Show ROCm runtimes known to ROCm CLI.
-    List,
+    ///
+    /// Each runtime is listed with its version (and build date), GPU family,
+    /// mode and toolchain, then its channel, package source, source layout
+    /// generation and exact GPU target as its manifest recorded them. A fact
+    /// recorded nowhere, or recorded blank, is shown as `unrecorded`; nothing
+    /// is guessed from other facts.
+    List {
+        /// Print the runtime list as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
@@ -1232,9 +1260,9 @@ pub(crate) enum ServicesCommand {
     ///
     /// Only works on a record that is not running: stop the server first (on
     /// Windows a process `rocm` cannot query counts as running). The record's
-    /// details file, log, engine state file, and endpoint key file are all
-    /// deleted, so its log can no longer be read and it can no longer be
-    /// restarted.
+    /// details file, log, engine state file, and endpoint key file (with any
+    /// copy of the key an interrupted save left beside it) are all deleted, so
+    /// its log can no longer be read and it can no longer be restarted.
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
@@ -1245,9 +1273,9 @@ pub(crate) enum ServicesCommand {
         ///
         /// Only when a stop was requested, no recorded process is confirmed
         /// running, and at least one could not be queried (on Windows, a live
-        /// process the account may not open). Deletes the record, log, engine
-        /// state and endpoint key, and says which process; if it is still
-        /// running it keeps running. Refused for a process confirmed running.
+        /// process the account may not open). Deletes the same files as a
+        /// plain `remove`, and says which process; if it is still running it
+        /// keeps running. Refused for a process confirmed running.
         #[arg(long)]
         force: bool,
     },
@@ -2122,6 +2150,24 @@ mod tests {
             }) => assert_eq!(runtime, "release-pip-x"),
             other => panic!("expected runtimes activate, got {other:?}"),
         }
+    }
+
+    /// `--json` belongs to `list` alone: bare `rocm runtimes` stays the text
+    /// listing, so a script has to name the subcommand to get JSON.
+    #[test]
+    fn runtimes_json_is_a_list_flag() {
+        for (args, json) in [(&["list", "--json"][..], true), (&["list"][..], false)] {
+            match parse_runtimes(args).expect("runtimes list parses").command {
+                Some(Command::Runtimes {
+                    command: Some(RuntimesCommand::List { json: parsed }),
+                }) => assert_eq!(parsed, json, "{args:?}"),
+                other => panic!("expected runtimes list, got {other:?}"),
+            }
+        }
+        assert!(
+            parse_runtimes(&["--json"]).is_err(),
+            "`rocm runtimes --json` must be rejected, not read as `list --json`"
+        );
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {

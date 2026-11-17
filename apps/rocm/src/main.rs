@@ -757,6 +757,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             };
             let arguments = serde_json::from_str(arguments_json.trim_start_matches('\u{feff}'))
                 .with_context(|| format!("failed to parse arguments JSON for `{name}`"))?;
+            let arguments = chat::mcp_call_cli_arguments(&name, arguments)?;
             let value = chat::run_internal_mcp_call(&paths, &name, arguments, allow_mutation)?;
             println!("{}", serde_json::to_string(&value)?);
             Ok(())
@@ -1893,7 +1894,7 @@ pub(crate) mod tests {
         Ok(record)
     }
 
-    /// Everything [`plant_service_record`] writes *except* the 0600 endpoint
+    /// Everything [`plant_service_record`] writes *except* the owner-only endpoint
     /// key: the manifest, the log, and the engine state file.
     ///
     /// Split out for the launch-lock test below, which writes the key itself —

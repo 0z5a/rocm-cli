@@ -40,7 +40,8 @@ pub(crate) struct AlignmentFailure {
     /// Informational, for a person reading the file: the skip decision
     /// ([`Self::skips_alignment`]) does not read it.
     pub(crate) pinned_llamacpp_tag: Option<String>,
-    /// The newest llama.cpp build tag tier 2 looked up, when the lookup worked.
+    /// The llama.cpp build tag tier 2 looked up (the newest one that ships an
+    /// archive for the target ROCm version), when the lookup worked.
     /// Informational, for a person reading the file: the skip decision does not
     /// read it.
     pub(crate) latest_llamacpp_tag: Option<String>,
