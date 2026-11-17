@@ -4498,7 +4498,11 @@ a daemon that recovered or found another daemon serving is not reported
 (`a_failure_ends_when_another_daemon_serves_the_socket`), or finds another
 daemon serving when the dashboard closes
 (`a_failure_is_not_reported_once_another_daemon_serves_the_socket`), a failed
-daemon does not hold the dashboard up, the retry waits
+daemon does not hold the dashboard up (`a_failed_daemon_does_not_hold_up_the_dashboard`),
+the wait before the dashboard draws, on tokio's paused clock, ending once the
+socket answers (`the_ready_wait_ends_once_the_socket_answers`), at once when the
+daemon has failed (`the_ready_wait_ends_at_once_when_the_daemon_has_failed`) and
+after its limit otherwise (`the_ready_wait_gives_up_after_its_limit`), the retry waits
 (`a_failing_daemon_backs_off_and_finding_an_owner_resets_it`), a removed socket
 served again without a failure (`a_removed_socket_is_served_again_without_a_failure`),
 the report's count (`the_report_counts_failed_attempts_from_two`), and a

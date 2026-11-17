@@ -216,7 +216,9 @@ cargo build --release
 This produces the two binaries under `target/release/`:
 
 - `rocm`: the CLI and interactive interfaces
-- `rocmd`: the background telemetry daemon used by the dashboard
+- `rocmd`: the background daemon: it runs the watchers and the managed-service
+  supervisor, and serves the MCP tools (the dashboard's telemetry daemon runs
+  inside `rocm dash` itself, not in `rocmd`)
 
 Run without installing:
 

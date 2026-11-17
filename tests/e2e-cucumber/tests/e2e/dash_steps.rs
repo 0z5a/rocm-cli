@@ -1805,6 +1805,12 @@ async fn file_at_telemetry_socket_path(world: &mut E2eWorld) {
     std::fs::write(&path, NOT_A_SOCKET_CONTENTS).expect("failed to plant the file");
 }
 
+/// `text` with all whitespace removed: a long report line wraps across
+/// screen rows, possibly at a space, so both sides of a match are squashed.
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
 /// Read once the dashboard has exited: the report goes to the terminal the
 /// dashboard gave back, so it is on the main screen. A long line wraps across
 /// rows, possibly at a space, so whitespace is dropped from both sides before
@@ -1821,7 +1827,6 @@ async fn file_at_telemetry_socket_path(world: &mut E2eWorld) {
 async fn dashboard_reports_unusable_socket(world: &mut E2eWorld) {
     let path = telemetry_socket_path(world).display().to_string();
     let screen = session(world).drain_final_screen().await;
-    let squash = |text: &str| -> String { text.split_whitespace().collect() };
     let shown = squash(&screen);
     assert!(
         shown.contains(&squash(&format!(
@@ -1841,11 +1846,7 @@ async fn dashboard_reports_unusable_socket(world: &mut E2eWorld) {
         "expected the report to name {}, got:\n{screen}",
         log_dir.display()
     );
-    let logged: String = std::fs::read_dir(&log_dir)
-        .unwrap_or_else(|e| panic!("no log directory {}: {e}", log_dir.display()))
-        .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-        .collect();
+    let logged = client_log(&log_dir);
     assert!(
         logged.contains("could not serve its socket") && logged.contains(&path),
         "the log the report points at holds no warning about {path}"
@@ -1923,7 +1924,6 @@ async fn dashboard_shows_disconnected(world: &mut E2eWorld) {
 async fn dashboard_reports_daemon_stopped_serving(world: &mut E2eWorld) {
     let path = telemetry_socket_path(world).display().to_string();
     let screen = session(world).drain_final_screen().await;
-    let squash = |text: &str| -> String { text.split_whitespace().collect() };
     let shown = squash(&screen);
     let opening = squash("telemetry daemon stopped serving:");
     let Some((_, report)) = shown.split_once(&opening) else {

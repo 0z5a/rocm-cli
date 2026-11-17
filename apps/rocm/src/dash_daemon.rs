@@ -117,27 +117,46 @@ pub(crate) async fn spawn_keeper(
         let target = connect.strip_prefix("unix:")?;
         let opts = crate::dash::runner_options(config, paths, false);
         let keeper = start(Path::new(target), opts, TAKEOVER_POLL);
-        // Poll until something accepts connections; a fixed sleep is
-        // race-prone on slow or loaded systems. Stop waiting as soon as the
-        // daemon has failed: nothing will answer, and the TUI client keeps
-        // reconnecting on its own. Probe with `socket_answers`, which reads
-        // the daemon's greeting before hanging up: a bare connect that hung
-        // up first would have the daemon log a client error for every
-        // dashboard opened. `the_probe_waits_for_the_greeting_before_hanging_up`
+        // Probe with `socket_answers`, which reads the daemon's greeting
+        // before hanging up: a bare connect that hung up first would have the
+        // daemon log a client error for every dashboard opened.
+        // `the_probe_waits_for_the_greeting_before_hanging_up`
         // (rocm-dash-daemon's server.rs) proves the probe reads the greeting.
-        let deadline = tokio::time::Instant::now() + READY_WAIT;
-        while !rocm_dash_daemon::server::socket_answers(Path::new(target)).await
-            && tokio::time::Instant::now() < deadline
-            && keeper.failure.lock().is_ok_and(|slot| slot.is_none())
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_until_ready(
+            || rocm_dash_daemon::server::socket_answers(Path::new(target)),
+            &keeper.failure,
+        )
+        .await;
         Some(keeper)
     }
     #[cfg(windows)]
     {
         let _ = (connect, config, paths);
         None
+    }
+}
+
+/// How often [`wait_until_ready`] probes the socket.
+#[cfg(unix)]
+const READY_POLL: Duration = Duration::from_millis(20);
+
+/// Wait until `answers` says something serves the socket, polling every
+/// [`READY_POLL`] rather than sleeping a fixed time, which is race-prone on
+/// slow or loaded systems. Stop at once if a failure is recorded in `failure`
+/// (nothing will answer, and the TUI client keeps reconnecting on its own),
+/// and after [`READY_WAIT`] at most, so the dashboard draws anyway.
+#[cfg(unix)]
+async fn wait_until_ready<P, F>(mut answers: P, failure: &Mutex<Option<KeeperFailure>>)
+where
+    P: FnMut() -> F,
+    F: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + READY_WAIT;
+    while !answers().await
+        && tokio::time::Instant::now() < deadline
+        && failure.lock().is_ok_and(|slot| slot.is_none())
+    {
+        tokio::time::sleep(READY_POLL).await;
     }
 }
 
@@ -952,6 +971,72 @@ mod tests {
             started.elapsed()
         );
         assert!(stop_keeper(keeper).await.is_some());
+    }
+
+    /// Waits for the socket to answer, with a probe that answers after
+    /// `answers_after` probes (never, for `None`) and a failure slot holding
+    /// `failure`; returns how long it waited and how many probes it made.
+    async fn ready_wait(
+        answers_after: Option<usize>,
+        failure: Option<KeeperFailure>,
+    ) -> (Duration, usize) {
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let slot = std::sync::Mutex::new(failure);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(
+            super::READY_WAIT * 2,
+            super::wait_until_ready(
+                || {
+                    let made = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let answers = answers_after.is_some_and(|after| made > after);
+                    async move { answers }
+                },
+                &slot,
+            ),
+        )
+        .await
+        .expect("the ready wait must end by itself");
+        (
+            started.elapsed(),
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// A socket that answers ends the ready wait at the first probe that
+    /// finds it answering, not after the full wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_wait_ends_once_the_socket_answers() {
+        assert_eq!(ready_wait(Some(0), None).await, (Duration::ZERO, 1));
+        assert_eq!(
+            ready_wait(Some(2), None).await,
+            (super::READY_POLL * 2, 3),
+            "it polls until the socket answers"
+        );
+    }
+
+    /// A socket that never answers, with no failure recorded, ends the ready
+    /// wait after [`READY_WAIT`], so the dashboard draws anyway.
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_wait_gives_up_after_its_limit() {
+        let (waited, _) = ready_wait(None, None).await;
+        assert!(
+            waited >= super::READY_WAIT && waited < super::READY_WAIT + super::READY_POLL,
+            "waited {waited:?}"
+        );
+    }
+
+    /// A failure already recorded ends the ready wait at once: nothing will
+    /// answer.
+    #[tokio::test(start_paused = true)]
+    async fn the_ready_wait_ends_at_once_when_the_daemon_has_failed() {
+        let failure = KeeperFailure {
+            socket: std::path::PathBuf::from("/run/user/1000/rocmdashd.sock"),
+            error: "refused".into(),
+            failed_attempts: 1,
+            served: false,
+            logged: true,
+        };
+        assert_eq!(ready_wait(None, Some(failure)).await, (Duration::ZERO, 1));
     }
 
     /// A keeper that died of a panic is reported too, not dropped silently.
