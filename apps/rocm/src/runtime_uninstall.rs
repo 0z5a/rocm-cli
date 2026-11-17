@@ -780,6 +780,51 @@ mod tests {
         }
     }
 
+    /// The refusal above stops a real `rocm runtimes uninstall` before it
+    /// touches anything: a runtime whose matching in-tree manifest says its
+    /// folder is the home folder is refused, and the folder, its files and its
+    /// registry entry are all still there afterwards. Home is pointed at the
+    /// runtime's own sandbox folder, under the process-wide env locks.
+    #[test]
+    fn runtime_uninstall_of_a_runtime_in_the_home_folder_is_refused_and_removes_nothing()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-uninstall-home-folder");
+        let manifest = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let home = manifest.install_root.clone();
+        let registry = runtime_manifest_path(&paths, &manifest.runtime_key);
+        let mut config = RocmCliConfig::default();
+        let result = {
+            let _process_env = crate::test_support::PROCESS_ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut env = crate::tests::ScopedTestEnv::new();
+            env.set("HOME", &home.display().to_string());
+            env.set("USERPROFILE", &home.display().to_string());
+            uninstall_runtime(&paths, &mut config, &manifest.runtime_key)
+        };
+        let folder_kept = home.join(".rocm-cli-runtime.json").is_file()
+            && manifest
+                .python_executable
+                .as_deref()
+                .is_some_and(|python| Path::new(python).is_file());
+        let registry_kept = registry.is_file();
+        let _ = fs::remove_dir_all(&root);
+        let err = result.expect_err("a runtime in the home folder must be refused");
+        assert!(
+            err.to_string().ends_with("because it is your home folder"),
+            "{err}"
+        );
+        assert!(folder_kept, "the home folder's contents were removed");
+        assert!(registry_kept, "the registry entry was removed");
+        Ok(())
+    }
+
     /// The gate above is the last thing between a registry entry and
     /// `fs::remove_dir_all`, and the path it is handed is text somebody else
     /// wrote. One folder has many spellings, so the refusal has to survive all

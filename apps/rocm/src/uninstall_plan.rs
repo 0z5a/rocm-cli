@@ -322,9 +322,20 @@ pub(crate) fn judge_uninstall_root(
         shown: None,
         real: None,
     };
-    let resolved_home = home.map(|home| {
-        canonicalize(home).unwrap_or_else(|_| rocm_core::resolve_path_through_symlinks(home))
-    });
+    // Home is resolved like everything else here, failing closed. Only a home
+    // folder that does not exist falls back to its spelling resolved as far as
+    // it goes: an existing root cannot really be a place that does not exist,
+    // so nothing it is compared against is lost. Any other failure would let a
+    // root that really is home miss the comparison: refuse instead
+    // (`a_home_folder_that_cannot_be_resolved_refuses_the_root`).
+    let resolved_home = match home.map(canonicalize) {
+        None => None,
+        Some(Ok(real)) => Some(real),
+        Some(Err(err)) if err.kind() == io::ErrorKind::NotFound => {
+            home.map(rocm_core::resolve_path_through_symlinks)
+        }
+        Some(Err(_)) => return unresolvable,
+    };
     // A system location that exists but cannot be resolved would drop out of
     // the comparison and leave its real location unprotected: refuse instead.
     let Some(resolved_system_roots) = resolved_system_roots(canonicalize) else {
@@ -609,6 +620,11 @@ pub(crate) fn build_uninstall_plan_with(
         ));
     }
 
+    // Load-bearing order: a path sorts before every path inside it, so a
+    // folder is removed before anything planned inside it. `apply_uninstall_plan`
+    // relies on that to report an entry already removed with an earlier one as
+    // removed (see `an_entry_removed_with_an_earlier_one_is_still_reported`),
+    // rather than re-checking a path that is gone.
     plan.actions
         .sort_by(|left, right| left.path.cmp(&right.path));
     plan.actions.dedup_by(|left, right| left.path == right.path);
@@ -1409,7 +1425,24 @@ mod tests {
             )),
             "{rendered}"
         );
-        assert!(!rendered.contains("Choose Review uninstall"), "{rendered}");
+        // On a terminal, where a dry run otherwise ends by inviting a real
+        // run, a refused one says what clears it instead.
+        let on_terminal = super::render_uninstall_plan(
+            &plan,
+            &super::UninstallOptions {
+                dry_run: true,
+                ..options
+            },
+            super::PlanAudience::Terminal,
+        );
+        assert!(
+            on_terminal.contains("This uninstall would be refused."),
+            "{on_terminal}"
+        );
+        assert!(
+            !on_terminal.contains("To remove these items"),
+            "{on_terminal}"
+        );
 
         let keep = super::UninstallOptions {
             keep_data: true,
@@ -2236,6 +2269,46 @@ mod tests {
             let system = system.clone();
             let resolve = move |path: &Path| {
                 if path == system {
+                    Err(std::io::Error::from(kind))
+                } else {
+                    rocm_core::canonicalize_for_compare(path)
+                }
+            };
+            super::build_uninstall_plan_with(
+                &data_only(home.join("data"), &root),
+                &rocm_core::AppPathSources::default(),
+                &keep_binaries(),
+                Some(&home),
+                &resolve,
+            )
+            .unwrap()
+        };
+        let denied = plan_with(std::io::ErrorKind::PermissionDenied);
+        let missing = plan_with(std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(denied.refused.len(), 1, "{denied:?}");
+        assert_eq!(
+            denied.refused[0].why,
+            rocm_core::ProtectedLocation::Unresolvable
+        );
+        assert!(denied.actions.is_empty(), "{denied:?}");
+        assert!(missing.refused.is_empty(), "{missing:?}");
+        assert_eq!(missing.actions.len(), 1, "{missing:?}");
+    }
+
+    /// A home folder that exists but cannot be resolved refuses the root as
+    /// unresolvable, as a system location does: otherwise a root that really
+    /// is home could miss the comparison. A home folder that does not exist
+    /// is compared by its spelling, so a root elsewhere is still planned.
+    #[test]
+    fn a_home_folder_that_cannot_be_resolved_refuses_the_root() {
+        let root = sandbox("home-unresolvable");
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("data")).unwrap();
+        let plan_with = |kind: std::io::ErrorKind| {
+            let unresolvable = home.clone();
+            let resolve = move |path: &Path| {
+                if path == unresolvable {
                     Err(std::io::Error::from(kind))
                 } else {
                     rocm_core::canonicalize_for_compare(path)

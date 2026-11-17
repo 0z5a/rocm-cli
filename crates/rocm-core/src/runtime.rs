@@ -837,6 +837,12 @@ pub fn runtime_protected_location_for_home(
 /// remove-old-installs` and the assistant's SDK `--prefix` check accept a
 /// folder inside them. Adding them would change what those accept; the two
 /// lists have not been reconciled.
+///
+/// The two rules also differ in order. [`uninstall_root_verdict_on`] checks
+/// the system locations before the home folder, so a home of `/usr/sbin`
+/// cannot open up `/usr`; [`protected_location_on`] checks the home folder
+/// first, so a runtime under `/root/.rocm` stays removable when `/root` is
+/// home (`a_root_users_home_is_refused_as_a_home`).
 fn system_roots(platform: RuntimePlatform) -> Vec<PathBuf> {
     if platform.is_windows() {
         return uninstall_system_roots_on(platform, &windows_system_drive());

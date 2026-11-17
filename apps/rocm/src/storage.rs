@@ -1656,6 +1656,10 @@ mod tests {
         let plan = build_prune_plan(&paths, &RocmCliConfig::default(), 1)?;
         let _ = std::fs::remove_dir_all(root);
 
+        // "Left in place" is held by the plan: prune removes exactly
+        // `plan.remove`, which `prune_removes_the_install_it_named_and_not_a_case_twin_of_it`
+        // shows on disk. A protected system folder cannot be staged in a
+        // sandbox, so this pins the plan and the line together.
         assert!(plan.remove.is_empty(), "{:?}", plan.remove);
         let expected = format!(
             "old: folder {} is a protected system location, so it is left in place",
