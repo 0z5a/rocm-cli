@@ -43,7 +43,9 @@ const BENCH_RING_CAP: usize = rocm_dash_core::bench_schema::BENCH_HISTORY_CAP;
 /// Access control is enforced by filesystem permissions: the Unix socket is
 /// created with mode `0o600` so only the owning user can connect. The socket's
 /// directory is checked before anything is created in it, judged by what it
-/// resolves to when it is a symlink:
+/// resolves to when it is a symlink (a bare file name, created in the current
+/// directory, is the exception: that directory is not checked, see
+/// `socket_parent`):
 ///
 /// * a missing one is created with mode `0o700`;
 /// * something that is not a directory is always refused, first;
@@ -544,7 +546,20 @@ impl SocketClaim {
 
     /// Bind the claimed path, restricted to mode `0o600`.
     pub(crate) fn bind(&mut self) -> anyhow::Result<tokio::net::UnixListener> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
+
+        self.bind_with(|path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        })
+    }
+
+    /// [`Self::bind`] with the chmod to `0o600` swapped, so a test can make
+    /// it fail.
+    fn bind_with(
+        &mut self,
+        restrict: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> anyhow::Result<tokio::net::UnixListener> {
+        use std::os::unix::fs::MetadataExt;
 
         let path = &self.path;
         let listener = match tokio::net::UnixListener::bind(path) {
@@ -553,18 +568,7 @@ impl SocketClaim {
             // taking the lock (a daemon of an older build): it is in use.
             // Unless what appeared there is not a socket at all.
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                use std::os::unix::fs::FileTypeExt;
-
-                let is_socket = std::fs::symlink_metadata(path)
-                    .map_or(true, |meta| meta.file_type().is_socket());
-                if !is_socket {
-                    return Err(anyhow!(not_a_socket_refusal(path)));
-                }
-                return Err(SocketInUse {
-                    path: path.clone(),
-                    holder: SocketHolder::UnlockedListener,
-                }
-                .into());
+                return Err(bind_in_use_refusal(path, std::fs::symlink_metadata(path)));
             }
             Err(e) => return Err(e).with_context(|| format!("binding {}", path.display())),
         };
@@ -575,10 +579,34 @@ impl SocketClaim {
         let meta = std::fs::symlink_metadata(path)
             .with_context(|| format!("inspecting bound socket {}", path.display()))?;
         self.bound = Some((meta.dev(), meta.ino()));
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on {}", path.display()))?;
+        restrict(path).with_context(|| format!("setting permissions on {}", path.display()))?;
         Ok(listener)
     }
+}
+
+/// Why a bind that found the path taken (`AddrInUse`) is refused, given what
+/// the path names now: something that is not a socket is refused as such;
+/// a socket, or a path that vanished or cannot be inspected since, is
+/// reported in use by something without the lock (a daemon of an older
+/// build), which the caller retries later. For a path that vanished, the
+/// error's "already serves" overstates what is there, but the response it
+/// gets -- the keeper's slower retry -- is the right one: whatever held the
+/// path a moment ago may be back.
+#[cfg(unix)]
+fn bind_in_use_refusal(
+    path: &std::path::Path,
+    now: std::io::Result<std::fs::Metadata>,
+) -> anyhow::Error {
+    use std::os::unix::fs::FileTypeExt;
+
+    if !now.map_or(true, |meta| meta.file_type().is_socket()) {
+        return anyhow!(not_a_socket_refusal(path));
+    }
+    SocketInUse {
+        path: path.to_path_buf(),
+        holder: SocketHolder::UnlockedListener,
+    }
+    .into()
 }
 
 /// What a claim's socket path names now.
@@ -711,6 +739,17 @@ async fn run_unix(
     serve_unix(path, opts, ready, ServeSeams::production()).await
 }
 
+/// The directory a socket path is created in, or `None` for a bare file name
+/// such as `unix:rocmdashd.sock`, which is created in the current directory.
+/// That directory is deliberately left unchecked: the check may chmod a
+/// directory of ours to `0o700`, which must not happen to whatever directory
+/// the daemon was started from, and its parent, the empty path, is one the
+/// check refuses, so the daemon would never serve.
+#[cfg(unix)]
+fn socket_parent(path: &std::path::Path) -> Option<&std::path::Path> {
+    path.parent().filter(|p| !p.as_os_str().is_empty())
+}
+
 #[cfg(unix)]
 async fn serve_unix(
     path: PathBuf,
@@ -718,7 +757,7 @@ async fn serve_unix(
     ready: impl FnOnce() + Send,
     seams: ServeSeams,
 ) -> anyhow::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = socket_parent(&path);
     // The lock file lives in the socket's directory, so that directory has to
     // exist, be one another user does not control, and be private (no group
     // or other access, see `socket_dir_verdict`) if it is ours and not sticky,
@@ -1966,6 +2005,125 @@ mod tests {
             "{refusal:#}"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    }
+
+    /// A bind that finds the path taken reports what the path names now: a
+    /// file as not a socket, and a socket -- or a path that vanished since,
+    /// which is not a reason to call it something else -- as in use by
+    /// something without the lock.
+    #[test]
+    fn a_bind_that_finds_the_path_taken_reports_what_is_there_now() {
+        use super::bind_in_use_refusal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+
+        let vanished = bind_in_use_refusal(
+            &path,
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
+        assert_eq!(
+            in_use_holder(&vanished),
+            Some(SocketHolder::UnlockedListener),
+            "{vanished:#}"
+        );
+
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let socket = bind_in_use_refusal(&path, std::fs::symlink_metadata(&path));
+        assert_eq!(
+            in_use_holder(&socket),
+            Some(SocketHolder::UnlockedListener),
+            "{socket:#}"
+        );
+
+        let file = dir.path().join("file.sock");
+        std::fs::write(&file, "keep me").unwrap();
+        let refusal = bind_in_use_refusal(&file, std::fs::symlink_metadata(&file));
+        assert!(in_use_path(&refusal).is_none(), "{refusal:#}");
+        assert!(
+            format!("{refusal:#}").contains(&not_a_socket_refusal(&file)),
+            "{refusal:#}"
+        );
+    }
+
+    /// A claim whose chmod of the bound socket fails still removes that socket
+    /// when it is dropped: the socket's identity is recorded before the chmod.
+    #[tokio::test]
+    async fn a_claim_whose_chmod_fails_still_removes_its_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let mut claim = SocketClaim::claim(&path).await.unwrap();
+
+        let refusal = claim
+            .bind_with(|_| Err(std::io::Error::other("chmod refused")))
+            .expect_err("a failed chmod fails the bind");
+
+        assert!(
+            format!("{refusal:#}").contains("setting permissions on"),
+            "{refusal:#}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path).is_ok(),
+            "the socket was bound"
+        );
+        drop(claim);
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "dropping the claim removes the socket it bound"
+        );
+    }
+
+    /// A socket the probe cannot connect to for a reason other than nobody
+    /// listening -- here its mode forbids connecting -- is reported as a
+    /// failed probe: not replaced as stale, and not taken as answering.
+    /// Skipped as root, whom the mode does not stop.
+    #[tokio::test]
+    async fn a_socket_the_probe_cannot_reach_is_reported_not_replaced() {
+        if effective_uid() == 0 {
+            eprintln!("skip: root may connect whatever the socket's mode");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let theirs = inode(&path);
+
+        let Err(refusal) = SocketClaim::claim(&path).await else {
+            panic!("a socket that cannot be probed must be refused");
+        };
+
+        assert!(
+            format!("{refusal:#}").contains("probing existing socket"),
+            "{refusal:#}"
+        );
+        assert!(in_use_path(&refusal).is_none(), "not in use: {refusal:#}");
+        assert_eq!(inode(&path), theirs, "the socket is left in place");
+    }
+
+    /// `socket_parent` gives a bare socket file name, such as
+    /// `unix:rocmdashd.sock`, no directory to check -- its parent is the
+    /// empty path, which the check refuses -- and every other path its own
+    /// directory. This drives the helper only: `serve_unix`'s use of it for a
+    /// bare name is not exercised, since that would change the process-wide
+    /// current directory under tests running in parallel.
+    #[test]
+    fn a_bare_socket_name_has_no_directory_to_check() {
+        use super::socket_parent;
+
+        assert_eq!(socket_parent(Path::new("rocmdashd.sock")), None);
+        assert!(
+            check_socket_dir(Path::new(""), effective_uid()).is_err(),
+            "the empty path is no directory to check"
+        );
+        assert_eq!(
+            socket_parent(Path::new("/run/user/1000/rocmdashd.sock")),
+            Some(Path::new("/run/user/1000"))
+        );
+        assert_eq!(
+            socket_parent(Path::new("/rocmdashd.sock")),
+            Some(Path::new("/"))
+        );
     }
 
     /// Unreadable path checks give the path up only five in a row, with the

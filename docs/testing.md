@@ -4457,7 +4457,18 @@ a symlink planted at the lock path (`a_symlink_at_the_lock_path_is_not_followed`
 a path that is not a socket (`a_path_that_is_not_a_socket_is_never_removed`),
 a socket someone else put at the path (`dropping_a_claim_removes_only_its_own_socket`),
 a bind lost to a daemon without the lock (`a_bind_lost_to_a_listener_without_the_lock_is_reported_in_use`),
+what a bind that finds the path taken reports for a socket, a file or a path
+that vanished since (`a_bind_that_finds_the_path_taken_reports_what_is_there_now`),
+a failed chmod of the bound socket, which still leaves the socket to be removed
+(`a_claim_whose_chmod_fails_still_removes_its_socket`),
 a busy or slow listener (`a_busy_or_slow_listener_counts_as_answering_not_stale`),
+a socket the probe cannot reach, reported rather than replaced
+(`a_socket_the_probe_cannot_reach_is_reported_not_replaced`; run as root, it
+prints a skip line and counts as passed),
+the helper that gives a bare socket file name no directory to check
+(`a_bare_socket_name_has_no_directory_to_check`; it calls the helper only,
+since serving a bare name would change the process-wide current directory
+under parallel tests),
 a probe that stays for the greeting (`the_probe_waits_for_the_greeting_before_hanging_up`)
 and reads at most a bounded amount of it (`the_probe_reads_a_bounded_greeting_from_a_listener_that_never_ends_a_line`),
 a serving daemon whose socket is replaced (`a_daemon_whose_socket_is_replaced_gives_up_the_path`)
