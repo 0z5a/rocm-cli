@@ -293,8 +293,11 @@ impl std::fmt::Display for SocketInUse {
 impl std::error::Error for SocketInUse {}
 
 /// Returned by [`run`] when a serving daemon found its socket path removed or
-/// replaced. It stopped and released the path, so a retry can claim it again
-/// at once; this is not a failure to report.
+/// replaced.
+///
+/// It stopped and released the path, so a retry can claim it again (the
+/// dashboard's keeper retries after one poll); this is not a failure to
+/// report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketReplaced {
     /// The socket path that no longer names this daemon's socket.
@@ -1077,6 +1080,34 @@ mod tests {
             ),
             (0, 0o1700, 1000, Use, "root-owned, sticky, private"),
             (
+                0,
+                0o1770,
+                1000,
+                UseShared,
+                "root-owned, sticky, group may write",
+            ),
+            (
+                0,
+                0o1707,
+                1000,
+                UseShared,
+                "root-owned, sticky, others may write",
+            ),
+            (
+                1000,
+                0o1770,
+                1000,
+                UseShared,
+                "ours, sticky, group may write",
+            ),
+            (
+                1000,
+                0o1707,
+                1000,
+                UseShared,
+                "ours, sticky, others may write",
+            ),
+            (
                 1001,
                 0o1777,
                 1000,
@@ -1149,16 +1180,28 @@ mod tests {
         assert_eq!(log(), line, "nothing more is logged once it is private");
     }
 
-    /// A missing nested parent is created, at mode 0700.
+    /// A missing nested parent is created at mode 0700, and so is every
+    /// directory the recursive create makes on the way to it.
     #[test]
     fn creates_missing_parent_at_0700() {
+        let (captured, _guard) = log_at(tracing::Level::INFO);
         let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().join("nested").join("telemetry");
+        let nested = tmp.path().join("nested");
+        let parent = nested.join("telemetry");
         check_socket_dir(&parent, effective_uid()).expect("should create a new directory");
         assert_eq!(
             mode_bits(&parent),
             0o700,
             "newly created socket dir must be private"
+        );
+        // Created private, not made so afterwards: the directory the
+        // recursive create made on the way, which the check never chmods, is
+        // private too, and no restriction was logged.
+        assert_eq!(mode_bits(&nested), 0o700, "an intermediate directory");
+        let log = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+        assert!(
+            !log.contains("restricted socket directory"),
+            "a directory created private needs no chmod: {log}"
         );
     }
 

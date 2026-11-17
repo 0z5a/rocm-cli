@@ -343,7 +343,9 @@ pub(crate) enum Command {
     /// apply). With --prompt, or a prompt piped on standard input, sends that one
     /// prompt and prints the reply. Use `rocm config enable-provider` and
     /// `rocm config set-provider-key` first to configure a remote provider; the
-    /// `local` provider talks to a running server.
+    /// `local` provider talks to a running server. On Linux/WSL the interactive
+    /// chat shares the dashboard's telemetry daemon the way `rocm dash` does,
+    /// and, like it, prints why that daemon was failing after it closes.
     #[command(after_help = "EXAMPLES:\n  \
 rocm chat --prompt \"Explain ROCm in one sentence\"\n  \
 rocm chat --provider local --model qwen --prompt \"Hello\"\n  \
@@ -710,7 +712,7 @@ rocm logs --search error timeout")]
     /// lemonade_port in config.json. External models have no Services stop/restart
     /// controls; discovery is read-only and quitting leaves external servers running.
     ///
-    /// On Linux, open dashboards share one telemetry daemon; when the dashboard
+    /// On Linux/WSL, open dashboards share one telemetry daemon; when the dashboard
     /// running it closes, one still open takes it over. If the daemon was
     /// failing when the dashboard closed, the reason is printed after it closes,
     /// unless another dashboard's daemon is serving by then. If the dashboard's

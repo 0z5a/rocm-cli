@@ -4432,7 +4432,8 @@ is created in it and never chmodded
 `a_symlink_to_another_users_socket_directory_is_refused`) -- these inject a fake
 uid for the daemon through `ServeSeams::our_uid`, since a test cannot make a
 directory another user really owns; real cross-uid ownership is not exercised --
-a missing socket directory created private, and one of ours that group or
+a missing socket directory created private (every directory the recursive
+create makes on the way included, with no chmod logged), and one of ours that group or
 others have any access to (a `0o755` one included) tightened, before the claim,
 with no chmod on a second check
 (`creates_missing_parent_at_0700`,
@@ -4499,6 +4500,8 @@ a daemon that recovered or found another daemon serving is not reported
 daemon serving when the dashboard closes
 (`a_failure_is_not_reported_once_another_daemon_serves_the_socket`), a failed
 daemon does not hold the dashboard up (`a_failed_daemon_does_not_hold_up_the_dashboard`),
+a daemon that serves ends the dashboard's wait as soon as it answers, with
+nothing to report (`the_dashboard_waits_only_until_its_daemon_answers`),
 the wait before the dashboard draws, on tokio's paused clock, ending once the
 socket answers (`the_ready_wait_ends_once_the_socket_answers`), at once when the
 daemon has failed (`the_ready_wait_ends_at_once_when_the_daemon_has_failed`) and

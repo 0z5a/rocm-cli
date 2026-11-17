@@ -1736,9 +1736,20 @@ async fn second_dashboard_connected(world: &mut E2eWorld) {
 
 /// Records how many connections the client log holds first, so the surviving
 /// dashboard's reconnection can be told from the connection it already had.
+/// Both dashboards are connected by now, but the log is written through a
+/// non-blocking appender, so the second one's line may not be in the file
+/// yet; wait for both lines first, or that line arriving late would pass for
+/// the reconnection.
 #[when("the user quits the first dashboard")]
 async fn quit_first_dashboard(world: &mut E2eWorld) {
     let log_dir = world.app_paths().client_log_dir();
+    wait_for_log_lines(
+        &log_dir,
+        CLIENT_CONNECTED,
+        2,
+        "both dashboards' connections before the first one quits",
+    )
+    .await;
     world.dash_connections_before_quit =
         Some(client_log(&log_dir).matches(CLIENT_CONNECTED).count());
     quit_tui(world, "the first dashboard").await;

@@ -59,7 +59,11 @@ const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SERVED_LONG_ENOUGH: Duration = FAILURE_BACKOFF_MAX;
 
 /// How long the dashboard waits for the socket to answer before it draws
-/// anyway; the TUI client keeps reconnecting on its own after that.
+/// anyway; the TUI client keeps reconnecting on its own after that. The wait
+/// can run over by up to one [`READY_POLL`] and one probe: a probe of a
+/// listener that does not greet lasts until its own timeout
+/// (`STALE_PROBE_TIMEOUT` in rocm-dash-daemon's `server.rs`, 500 ms), and the
+/// limit is checked between probes.
 #[cfg(unix)]
 const READY_WAIT: Duration = Duration::from_secs(5);
 
@@ -97,8 +101,9 @@ pub(crate) struct Keeper {
     served: Arc<AtomicBool>,
 }
 
-/// Start this dashboard's keeper for a local `unix:` socket and wait (at most
-/// [`READY_WAIT`]) until the socket answers, whoever serves it.
+/// Start this dashboard's keeper for a local `unix:` socket and wait (about
+/// [`READY_WAIT`] at most; see there for how far it can run over) until the
+/// socket answers, whoever serves it.
 ///
 /// Returns `None`, starting nothing, for a non-unix `connect` target and on
 /// Windows. Stop the returned keeper with [`stop_keeper`].
@@ -144,7 +149,8 @@ const READY_POLL: Duration = Duration::from_millis(20);
 /// [`READY_POLL`] rather than sleeping a fixed time, which is race-prone on
 /// slow or loaded systems. Stop at once if a failure is recorded in `failure`
 /// (nothing will answer, and the TUI client keeps reconnecting on its own),
-/// and after [`READY_WAIT`] at most, so the dashboard draws anyway.
+/// and once [`READY_WAIT`] has passed (see there for how far a slow probe can
+/// carry it over), so the dashboard draws anyway.
 #[cfg(unix)]
 async fn wait_until_ready<P, F>(mut answers: P, failure: &Mutex<Option<KeeperFailure>>)
 where
@@ -298,8 +304,8 @@ pub(crate) const REPORT_STOPPED_SERVING: &str =
 /// its leading `rocm: `.
 pub(crate) const REPORT_LOG_LINE: &str = "rocm: each failed attempt is logged in the files under";
 
-/// The warning the keeper logs for each failed run. dash-56 looks for the
-/// fragment "could not serve its socket" from it in the client log.
+/// The warning the keeper logs for each failed run. dash-56 and dash-58 look
+/// for the fragment "could not serve its socket" from it in the client log.
 #[cfg(unix)]
 pub(crate) const KEEPER_WARNING: &str =
     "embedded telemetry daemon could not serve its socket; retrying";
@@ -692,7 +698,7 @@ mod tests {
         assert_eq!(
             next_step(&replaced, None, &mut retry, poll),
             NextStep::Reclaim(poll),
-            "a socket taken from a serving daemon is reclaimed at once, not reported"
+            "a socket taken from a serving daemon is reclaimed after one poll, not reported"
         );
         assert_eq!(next_step(&failed(), None, &mut retry, poll), secs(1));
 
@@ -1037,6 +1043,40 @@ mod tests {
             logged: true,
         };
         assert_eq!(ready_wait(None, Some(failure)).await, (Duration::ZERO, 1));
+    }
+
+    /// A daemon that starts and serves ends the dashboard's wait as soon as
+    /// its socket answers -- the real probe, not the time limit -- and a
+    /// daemon that served without failing leaves nothing to report.
+    #[tokio::test]
+    async fn the_dashboard_waits_only_until_its_daemon_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let paths = rocm_core::AppPaths {
+            config_dir: dir.path().join("config"),
+            data_dir: dir.path().join("data"),
+            cache_dir: dir.path().join("cache"),
+        };
+
+        let started = tokio::time::Instant::now();
+        let keeper = spawn_keeper(
+            &format!("unix:{}", path.display()),
+            &rocm_core::RocmCliConfig::default(),
+            &paths,
+        )
+        .await
+        .expect("a unix target gets a keeper");
+        let waited = started.elapsed();
+
+        assert!(
+            waited < super::READY_WAIT / 2,
+            "the dashboard waited {waited:?} for a daemon that serves"
+        );
+        assert!(
+            rocm_dash_daemon::server::socket_answers(&path).await,
+            "the daemon serves by the time the wait ends"
+        );
+        assert_eq!(stop_keeper(keeper).await, None);
     }
 
     /// A keeper that died of a panic is reported too, not dropped silently.
