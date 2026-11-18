@@ -1295,10 +1295,9 @@ mod tests {
         let mut hostile = failed_summary("connection closed mid-response");
         hostile.service_id = "svc $(id)".to_owned();
         let rendered = render_summary(&hostile);
-        assert!(
-            rendered.contains("check `rocm logs --service 'svc $(id)'`"),
-            "{rendered}"
-        );
+        // No `{rendered}` in the failure message: the rendered summary can
+        // carry an endpoint key, so it is not printed, like the asserts above.
+        assert!(rendered.contains("check `rocm logs --service 'svc $(id)'`"));
     }
 
     #[test]
