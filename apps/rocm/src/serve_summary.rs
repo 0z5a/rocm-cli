@@ -278,8 +278,8 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         // empty, hedged: the reason may be rocm's own plumbing, not the engine.
         let _ = writeln!(
             out,
-            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `rocm logs --service {id}`",
-            id = summary.service_id
+            "  note: the smoke test could not complete, so no metrics were measured ({reason}); the server may not be able to serve requests - check `{logs}`",
+            logs = crate::service_hints::service_logs_hint(&summary.service_id)
         );
     }
     for note in &summary.notes {
@@ -1290,6 +1290,15 @@ mod tests {
         // The hedge: the note must not claim the server is broken, only that it
         // may be unable to serve.
         assert!(rendered.contains("; the server may not be able to serve requests"));
+        // The id goes through the shared hint, so one that needs quoting is
+        // quoted here as in the summary's other notes.
+        let mut hostile = failed_summary("connection closed mid-response");
+        hostile.service_id = "svc $(id)".to_owned();
+        let rendered = render_summary(&hostile);
+        assert!(
+            rendered.contains("check `rocm logs --service 'svc $(id)'`"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -364,7 +364,10 @@ fn line_is_download(line: &str) -> bool {
 /// finished download: what follows is loading, so a quiet engine after it
 /// is judged by the load limit, not the download stall.
 fn line_is_active_download(line: &str) -> bool {
-    line_is_download(line) && last_percent(line) != Some("100")
+    line_is_download(line)
+        && !last_percent(line)
+            .and_then(|pct| pct.parse::<f64>().ok())
+            .is_some_and(|pct| pct >= 100.0)
 }
 
 /// Last `NN%` in the line, so a bar whose ETA keeps moving but whose percent
@@ -377,12 +380,15 @@ fn last_percent(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let mut search_end = bytes.len();
     while let Some(rel) = line[..search_end].rfind('%') {
+        // Digits with an optional fraction (`100.0%`), so a decimal percent is
+        // read whole rather than as the digits after its point.
         let mut start = rel;
-        while start > 0 && bytes[start - 1].is_ascii_digit() {
+        while start > 0 && (bytes[start - 1].is_ascii_digit() || bytes[start - 1] == b'.') {
             start -= 1;
         }
-        if start < rel {
-            return Some(&line[start..rel]);
+        let number = line[start..rel].trim_start_matches('.');
+        if number.bytes().any(|byte| byte.is_ascii_digit()) {
+            return Some(number);
         }
         search_end = rel;
     }
@@ -1159,7 +1165,28 @@ mod tests {
             &interactive(),
         ));
         assert_eq!(stop.reason, ServeStartupStopReason::SilentLoad);
-        // An unfinished percent is still a download.
+        // A decimal percent is read whole: `100.0%` is finished too.
+        signals.log_line = Some("Downloading model.safetensors: 100.0%".to_owned());
+        let view = assert_continue(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(past_download_stall + 1_000, past_download_stall),
+            &interactive(),
+        ));
+        assert_eq!(view.phase, ServeStartupPhase::Loading);
+        // An unfinished percent is still a download, decimal or not.
+        signals.log_line = Some("Downloading model.safetensors: 99.9%".to_owned());
+        let stop = assert_stop(decide_serve_startup(
+            "qwen",
+            "vllm",
+            EndpointReadiness::Unreachable,
+            &signals,
+            at(past_download_stall + 1_000, past_download_stall),
+            &interactive(),
+        ));
+        assert_eq!(stop.reason, ServeStartupStopReason::DownloadStalled);
         signals.log_line = Some("Downloading model.safetensors: 99%".to_owned());
         let stop = assert_stop(decide_serve_startup(
             "qwen",

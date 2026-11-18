@@ -989,6 +989,7 @@ Feature: Model serving
     And the engine received exactly one chat request
     And the deployment summary names the logs command for that service
     And the launch's service record is left as ready
+    And no background automation daemon was left behind
 
   # Interactive `rocm serve` under a real terminal: while it waits it names the
   # command that follows the engine's log, then it exits 0 once the endpoint

@@ -171,7 +171,7 @@ pub(crate) fn start_managed_service(
         let message = stop.user_message(requested_model, engine, service_id);
         let why = format!("{:?}", stop.reason);
         return Err(serve_progress::ServeStartupFailed {
-            message: settle_ended_launch(paths, service_id, &why, message),
+            message: settle_ended_launch(paths, service_id, &why, message, &service_pid_is_alive),
             server_running: false,
         }
         .into());
@@ -512,10 +512,14 @@ mod tests {
         paths.ensure()?;
         let child = std::rc::Rc::new(std::cell::RefCell::new(None::<u32>));
         let spawned = child.clone();
+        // The engine-state file the launch's record reads, for a child that
+        // plays an engine reporting its own status.
+        let engine_state = paths.service_engine_state_path("lemonade", service_id);
         TEST_SPAWN_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(std::rc::Rc::new(move |_command| {
                 let process = std::process::Command::new(argv[0])
                     .args(&argv[1..])
+                    .env("TEST_ENGINE_STATE", &engine_state)
                     .spawn()?;
                 *spawned.borrow_mut() = Some(process.id());
                 Ok(process)
@@ -638,6 +642,56 @@ mod tests {
                     && event.level == "error"
                     && event.service_id.as_deref() == Some(service_id)
                     && event.message.contains("ProcessExited")),
+            "the ended launch is audited: {:?}",
+            launch.audit
+        );
+        Ok(())
+    }
+
+    /// An engine that reports `failed` while its process is still up ends the
+    /// launch through the same settling path as an exit: the typed failure
+    /// does not ask `serve` to supervise it, names the stop command, the
+    /// record keeps the engine's own `failed` (which `rocmd` may restart:
+    /// `a_failed_record_with_a_live_process_is_still_recovered` in
+    /// apps/rocmd/src/watchers/server_recover.rs), and the end is audited.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_engine_that_fails_while_alive_is_settled_failed_and_not_supervised() -> Result<()> {
+        let service_id = "lemonade-startup-engine-failed";
+        let launch = launch_hooked_child(
+            service_id,
+            &[
+                "sh",
+                "-c",
+                "mkdir -p \"$(dirname \"$TEST_ENGINE_STATE\")\" && \
+                 printf '{\"status\":\"failed\"}' > \"$TEST_ENGINE_STATE\" && sleep 30",
+            ],
+            Duration::from_secs(5),
+        )?;
+        assert!(launch.child_alive_after, "the process stays up");
+        let failure = startup_failure(launch.result);
+        assert!(!failure.server_running, "{}", failure.message);
+        assert!(
+            failure.message.contains("the engine reported failed"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .contains(&crate::service_hints::service_stop_hint(service_id)),
+            "{}",
+            failure.message
+        );
+        assert_eq!(launch.record?.status, "failed");
+        assert!(
+            launch
+                .audit
+                .iter()
+                .any(|event| event.action == "managed_service_launch"
+                    && event.level == "error"
+                    && event.service_id.as_deref() == Some(service_id)
+                    && event.message.contains("EngineFailed")),
             "the ended launch is audited: {:?}",
             launch.audit
         );

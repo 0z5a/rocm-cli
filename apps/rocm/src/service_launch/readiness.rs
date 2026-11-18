@@ -100,13 +100,25 @@ fn service_still_live(paths: &AppPaths, service_id: &str, pid_alive: impl Fn(u32
 /// Record a server that died mid-start as stopped, leaving a manifest that a
 /// `services stop` already settled untouched. A `failed` state the engine
 /// reported is persisted rather than overwritten, so the reason survives.
-fn settle_exited_service(paths: &AppPaths, service_id: &str) {
+///
+/// The manifest is re-read here, after the caller decided the server ended.
+/// If it now describes a live process again, `rocmd` restarted the service in
+/// between (`restart_managed_service` in apps/rocmd/src/supervise.rs records
+/// the new pid through `record_spawned_supervisor`), and that restart is left alone rather than written back to
+/// `stopped`.
+fn settle_exited_service(paths: &AppPaths, service_id: &str, pid_alive: &dyn Fn(u32) -> bool) {
     let Ok(mut latest) = ManagedServiceRecord::read_manifest(paths, service_id) else {
         return;
     };
     let on_disk = latest.status.clone();
     let _ = latest.refresh_from_engine_state();
     if crate::managed_service_status::managed_service_is_live(&latest) {
+        if crate::managed_service_status::recorded_service_pids(&latest)
+            .into_iter()
+            .any(pid_alive)
+        {
+            return;
+        }
         latest.status = "stopped".to_owned();
     } else if latest.status == on_disk {
         return;
@@ -126,7 +138,7 @@ pub(super) fn died_during_wait(
 ) -> Option<anyhow::Error> {
     if !wait_until_ready
         || readiness == EndpointReadiness::Serving
-        || service_still_live(paths, service_id, pid_alive)
+        || service_still_live(paths, service_id, &pid_alive)
     {
         return None;
     }
@@ -138,7 +150,8 @@ pub(super) fn died_during_wait(
         paths,
         service_id,
         "exited during --wait",
-        message
+        message,
+        &pid_alive
     )))
 }
 
@@ -157,8 +170,9 @@ pub(super) fn settle_ended_launch(
     service_id: &str,
     why: &str,
     mut message: String,
+    pid_alive: &dyn Fn(u32) -> bool,
 ) -> String {
-    settle_exited_service(paths, service_id);
+    settle_exited_service(paths, service_id, pid_alive);
     crate::record_cli_audit_event(
         paths,
         "service",
@@ -650,9 +664,14 @@ mod tests {
     fn settle_exited_service_demotes_a_live_manifest_and_spares_a_settled_one() {
         let (root, paths) = test_paths("wait-settle");
         paths.ensure().expect("paths");
-        let mut record = record_tracking_pid(&paths, 0, "starting");
+        let mut record = record_tracking_pid(&paths, 4_242, "starting");
         record.write().expect("write");
-        settle_exited_service(&paths, &record.service_id);
+        // A manifest whose recorded process is alive again was restarted by
+        // `rocmd` after the caller decided the server ended: left alone.
+        settle_exited_service(&paths, &record.service_id, &|_| true);
+        let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
+        assert_eq!(after.status, "starting");
+        settle_exited_service(&paths, &record.service_id, &|_| false);
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "stopped");
 
@@ -661,7 +680,7 @@ mod tests {
         // be invisible).
         record.status = "failed".to_owned();
         record.write().expect("write");
-        settle_exited_service(&paths, &record.service_id);
+        settle_exited_service(&paths, &record.service_id, &|_| false);
         let after = ManagedServiceRecord::read_manifest(&paths, &record.service_id).unwrap();
         assert_eq!(after.status, "failed");
         let _ = fs::remove_dir_all(root);
@@ -728,6 +747,18 @@ mod tests {
                 .status
         };
 
+        let launch_errors = || {
+            rocm_core::load_recent_audit_events(&paths, 20)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|event| {
+                    event.action == "managed_service_launch"
+                        && event.level == "error"
+                        && event.service_id.as_deref() == Some(id.as_str())
+                })
+                .collect::<Vec<_>>()
+        };
+
         // Not waiting, already serving, or still alive: no failure, no change.
         let pending = EndpointReadiness::Unreachable;
         assert!(died_during_wait(&paths, &id, false, pending, |_| false).is_none());
@@ -736,6 +767,7 @@ mod tests {
         );
         assert!(died_during_wait(&paths, &id, true, pending, |_| true).is_none());
         assert_eq!(status(), "starting");
+        assert!(launch_errors().is_empty(), "{:?}", launch_errors());
 
         // Dead server: the error names the logs command and the record is settled.
         let error = died_during_wait(&paths, &id, true, pending, |_| false).expect("died");
@@ -749,6 +781,14 @@ mod tests {
             "{message}"
         );
         assert_eq!(status(), "stopped");
+        // The `--wait` death is audited like the interactive wait's.
+        let errors = launch_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|event| event.message.contains("exited during --wait")),
+            "{errors:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

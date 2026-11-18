@@ -333,10 +333,10 @@ pub(crate) fn find_recoverable_service(
         if let Some(reason) = stale_manifest_recovery_reason(&record, now) {
             return Ok(Some((record, reason)));
         }
-        if manifest_service_recovery_reason(&record, now).is_some() {
-            // A live startup the guard above spared.
-            continue;
-        }
+        // A manifest reason the guard above spared (a live startup) needs no
+        // `continue`: `manifest_service_recovery_reason` only answers for
+        // `failed`, `exited`, `unreachable` and a stale `starting`/`recovering`,
+        // none of which the `ready`/`running` check below takes.
         if matches!(record.status.as_str(), "ready" | "running") {
             let Ok(healthcheck) = crate::engine_ipc::engine_healthcheck_response(
                 paths,
@@ -366,8 +366,15 @@ pub(crate) fn find_recoverable_service(
 /// recovered, or `None` when it should not.
 ///
 /// A live `running` process that has not opened its port is still the
-/// interactive serve wait's job: restarting it kills a download the CLI is
-/// reporting. A dead pid is not spared. One function for every place that
+/// interactive serve wait's job (`wait_for_launch_startup` in
+/// apps/rocm/src/service_launch/readiness.rs): restarting it kills a download
+/// the CLI is reporting. `running` is covered, not only `starting`, because
+/// the CLI records `running` once the endpoint lists the model
+/// (`status_for_readiness` in apps/rocm/src/main.rs) and the engines write
+/// their own state `running` before their port opens (`write_running_state`
+/// in engines/lemonade/src/state.rs, called before the server is ready). `ready` is not covered: a
+/// verified service that stops answering is a regression, not a startup.
+/// A dead pid is not spared. One function for every place that
 /// falls back to the endpoint, scan and event re-check, so none can drop the
 /// guard.
 fn unreachable_endpoint_recovery_reason(
@@ -401,6 +408,21 @@ pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
 /// or load before the port accepts connections. Endpoint-unreachable
 /// recovery during it restarts the process out from under that wait.
 fn live_startup_still_in_progress(record: &ManagedServiceRecord, now_unix_ms: u128) -> bool {
+    live_startup_still_in_progress_with(record, now_unix_ms, rocm_core::identity_state)
+}
+
+/// [`live_startup_still_in_progress`] with the identity check injected, so a
+/// test can give every answer a read can give.
+///
+/// A pid whose identity cannot be read (`IdentityState::Indeterminate`) is
+/// treated as possibly the startup and spared, as `proc_lifecycle` treats it
+/// as possibly alive and does not signal it: a failure to look is not an
+/// exit. Only `Recycled` and `Gone` are not the startup.
+fn live_startup_still_in_progress_with(
+    record: &ManagedServiceRecord,
+    now_unix_ms: u128,
+    identity: impl Fn(&ProcessIdentity) -> IdentityState,
+) -> bool {
     let started_at = record
         .last_restart_unix_ms
         .unwrap_or(record.created_at_unix_ms);
@@ -421,17 +443,22 @@ fn live_startup_still_in_progress(record: &ManagedServiceRecord, now_unix_ms: u1
     .flatten()
     .any(|(pid, start_ticks)| {
         pid != 0
-            && rocm_core::identity_state(&ProcessIdentity { pid, start_ticks })
-                == IdentityState::Matches
+            && matches!(
+                identity(&ProcessIdentity { pid, start_ticks }),
+                IdentityState::Matches | IdentityState::Indeterminate
+            )
     })
 }
 
 /// Why a stale or failed manifest should be recovered, or `None`.
 ///
 /// `rocm services` persists an engine's own `starting` state into the
-/// record, so a live server still downloading under the interactive serve
-/// wait (or left by a Ctrl-C of it) can read `starting` past the stale-start
-/// window. It is not stale until the startup deadline. Shared by the scan and
+/// record (`ManagedServiceRecord::refresh_from_engine_state` in
+/// crates/rocm-core/src/service_record.rs), and the interactive serve wait
+/// records a launch that never listed the model as `starting`
+/// (`status_for_readiness` in apps/rocm/src/main.rs), so a live server still
+/// downloading under that wait (or left by a Ctrl-C of it) can read
+/// `starting` past the stale-start window. It is not stale until the startup deadline. Shared by the scan and
 /// the event re-check, so neither can drop the guard.
 fn stale_manifest_recovery_reason(
     record: &ManagedServiceRecord,
@@ -1347,6 +1374,93 @@ mod tests {
             "at the startup deadline a live process with a closed port is recoverable"
         );
         Ok(())
+    }
+
+    /// The guard covers `running` (and `starting`) but not `ready`: a service
+    /// that was verified serving and then stopped answering is recovered at
+    /// once, even with a live process inside the startup deadline.
+    #[test]
+    fn recovery_does_not_spare_a_ready_service_that_stopped_answering() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-ready-live");
+        paths.ensure()?;
+        let mut ready = ManagedServiceRecord::new(
+            &paths,
+            "svc-ready-live",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            free_loopback_port(),
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        ready.status = "ready".to_owned();
+        ready.created_at_unix_ms = unix_time_millis();
+        ready.write()?;
+        let found = find_recoverable_service(&paths)?;
+        let event = service_record_matches_recovery_event(
+            &paths,
+            &ready,
+            &recovery_event(&ready, "service.endpoint_recoverable"),
+        );
+        fs::remove_dir_all(root).ok();
+        assert_eq!(
+            found.map(|(record, reason)| (record.service_id, reason)),
+            Some((
+                "svc-ready-live".to_owned(),
+                "endpoint_status_unreachable".to_owned()
+            )),
+        );
+        assert!(event, "the event re-check authorizes the same restart");
+        Ok(())
+    }
+
+    /// Every identity answer: the startup is spared when its pid matches or
+    /// cannot be read, and not when it was recycled or is gone, or past the
+    /// deadline whatever the answer.
+    #[test]
+    fn the_live_startup_guard_spares_a_matching_or_unreadable_pid_only() {
+        let (root, paths) = temp_app_paths("recover-identity-answers");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-identity",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11435,
+            "managed",
+            4242,
+            None,
+            None,
+            None,
+        );
+        let now = unix_time_millis();
+        record.created_at_unix_ms = now;
+        for (answer, spared) in [
+            (IdentityState::Matches, true),
+            (IdentityState::Indeterminate, true),
+            (IdentityState::Recycled, false),
+            (IdentityState::Gone, false),
+        ] {
+            assert_eq!(
+                live_startup_still_in_progress_with(&record, now, |_| answer),
+                spared,
+                "{answer:?}"
+            );
+            assert!(
+                !live_startup_still_in_progress_with(
+                    &record,
+                    now + rocm_core::SERVE_STARTUP_DEADLINE.as_millis(),
+                    |_| answer
+                ),
+                "{answer:?} past the deadline"
+            );
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     /// `rocm services` writes an engine's own `starting` state into the
