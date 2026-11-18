@@ -312,8 +312,11 @@ twice, a known issue. If the daemon was failing when you quit the dashboard
 (it could not start, or stopped serving and had not recovered), and no other
 dashboard's daemon is serving by then, the dashboard says why after you quit
 it, however you opened it (`rocm dash`, interactive `rocm chat`, or the bare
-`rocm` launcher). If the dashboard's own supervision of its telemetry daemon
-crashes, that is reported even when another dashboard's daemon is serving. The
+`rocm` launcher), and also when you end it with Ctrl-C or it gets SIGINT or
+SIGTERM. If the dashboard's own supervision of its telemetry daemon crashes,
+that is reported even when another dashboard's daemon is serving, when you
+quit the dashboard; on Ctrl-C or a signal it is only written to the log
+files under the data directory's `logs` folder, as it happens. The
 dashboard presents five tabs (switch with `Tab`/`Shift+Tab` or number keys
 `1`–`5`):
 

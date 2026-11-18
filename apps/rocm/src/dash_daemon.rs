@@ -190,7 +190,7 @@ where
 {
     let failure = Arc::new(Mutex::new(None));
     let served = Arc::new(AtomicBool::new(false));
-    let handle = tokio::spawn(keep_daemon(
+    let handle = spawn_logging_panic(keep_daemon(
         socket.to_path_buf(),
         poll,
         Arc::clone(&failure),
@@ -205,6 +205,46 @@ where
     }
 }
 
+/// The error a keeper logs when it panics.
+#[cfg(unix)]
+const KEEPER_PANICKED: &str = "the embedded telemetry daemon's keeper panicked";
+
+/// Spawn a keeper's task, logging a panic in it at error level, with its
+/// message, from inside the task ([`LogPanic`]), and then letting the panic go
+/// on, so the task's `JoinHandle` still reports it to [`stop_keeper`]. Logged
+/// there rather than in [`stop_keeper`] because a signal or a typed Ctrl-C
+/// ends the process inside the TUI and [`stop_keeper`] never runs then.
+#[cfg(unix)]
+fn spawn_logging_panic(
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    tokio::spawn(LogPanic(Box::pin(task)))
+}
+
+/// A future that logs a panic in the one it wraps; see [`spawn_logging_panic`].
+#[cfg(unix)]
+struct LogPanic(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>);
+
+#[cfg(unix)]
+impl std::future::Future for LogPanic {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let inner = &mut self.0;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.as_mut().poll(cx))) {
+            Ok(poll) => poll,
+            Err(payload) => {
+                let message = panic_message(payload.as_ref());
+                tracing::error!(error = %message, "{KEEPER_PANICKED}");
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+}
+
 /// Stop a keeper and wait for it, so the daemon it may own has removed its
 /// socket (only if it still is that daemon's socket) and released the path
 /// before the runtime is dropped. A keeper that never owned the socket
@@ -215,8 +255,9 @@ where
 /// another daemon serves the socket by then: a failure is recorded before the
 /// keeper waits to retry, and while it waited another dashboard's daemon may
 /// have taken the socket and this dashboard worked on it until it closed. A
-/// keeper that had panicked is logged and reported, ahead of any failure its
-/// daemon was in before the panic.
+/// keeper that had panicked is reported, ahead of any failure its daemon was
+/// in before the panic; the panic itself was logged by the task as it
+/// happened ([`spawn_logging_panic`]).
 pub(crate) async fn stop_keeper(keeper: Keeper) -> Option<KeeperFailure> {
     let Keeper {
         socket,
@@ -226,11 +267,7 @@ pub(crate) async fn stop_keeper(keeper: Keeper) -> Option<KeeperFailure> {
     } = keeper;
     handle.abort();
     let panicked = match handle.await {
-        Err(e) if e.is_panic() => {
-            let message = panic_message(e.into_panic().as_ref());
-            tracing::error!(error = %message, "the embedded telemetry daemon's keeper panicked");
-            Some(message)
-        }
+        Err(e) if e.is_panic() => Some(panic_message(e.into_panic().as_ref())),
         _ => None,
     };
     let recorded = failure.lock().map_or(None, |slot| slot.clone());
@@ -288,8 +325,68 @@ async fn another_daemon_serves(socket: &Path) -> bool {
     false
 }
 
+/// Whether a daemon answers at `socket`, for a caller that cannot await (see
+/// [`report_on_forced_exit`]).
+#[cfg(unix)]
+fn another_daemon_serves_blocking(socket: &Path) -> bool {
+    rocm_dash_daemon::server::socket_answers_blocking(socket)
+}
+
+/// No daemon socket on Windows (and no keeper there to ask).
+#[cfg(windows)]
+fn another_daemon_serves_blocking(socket: &Path) -> bool {
+    let _ = socket;
+    false
+}
+
+/// Have the failure report printed if the process is ended by a signal or a
+/// typed Ctrl-C while `keeper` runs, until the returned guard is dropped.
+///
+/// Those exits end in `std::process::exit` inside the TUI
+/// (`spawn_termination_watcher` and `exit_on_ctrl_c` in rocm-dash-tui's
+/// `app/terminal.rs`), so [`stop_keeper`] never runs on them; the TUI runs
+/// this hook instead, once the terminal is restored. It prints the report for
+/// the failure recorded at that moment, through [`forced_exit_report`], and
+/// nothing when none is. Unlike [`stop_keeper`] it cannot stop the keeper and
+/// wait for it, so a keeper that panicked is not reported on these exits; the
+/// panic is still logged, by the keeper's own task as it happens
+/// ([`spawn_logging_panic`]).
+pub(crate) fn report_on_forced_exit(
+    keeper: &Keeper,
+    log_dir: PathBuf,
+) -> rocm_dash_tui::app::PreExitHookGuard {
+    let failure = Arc::clone(&keeper.failure);
+    rocm_dash_tui::app::set_pre_exit_hook(move || {
+        if let Some(report) = forced_exit_report(&failure, &log_dir, another_daemon_serves_blocking)
+        {
+            // Not `eprintln!`, which panics if stderr is gone: the process is
+            // on its way out, and a report it cannot write is simply lost.
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{report}");
+        }
+    })
+}
+
+/// The report [`report_on_forced_exit`] prints: [`failure_report`] for the
+/// failure recorded in `failure`, unless none is or a daemon answers at its
+/// socket by now -- the same rule [`stop_keeper`] applies, here with
+/// `another_daemon_serves` as the probe. This keeper's daemon may still be
+/// running on this path, so a daemon that answers may be its own, recovered;
+/// there is nothing to report either way.
+fn forced_exit_report(
+    failure: &Mutex<Option<KeeperFailure>>,
+    log_dir: &Path,
+    another_daemon_serves: impl FnOnce(&Path) -> bool,
+) -> Option<String> {
+    let recorded = failure.lock().ok()?.clone()?;
+    if another_daemon_serves(&recorded.socket) {
+        return None;
+    }
+    Some(failure_report(&recorded, log_dir))
+}
+
 /// How the report opens for a daemon that never served the socket. dash-57
-/// (`dash_steps.rs`), which cannot import it, matches its tail from
+/// and dash-60 (`dash_steps.rs`), which cannot import it, match its tail from
 /// "telemetry daemon".
 pub(crate) const REPORT_COULD_NOT_START: &str =
     "rocm: the dashboard's telemetry daemon could not start:";
@@ -300,12 +397,13 @@ pub(crate) const REPORT_COULD_NOT_START: &str =
 pub(crate) const REPORT_STOPPED_SERVING: &str =
     "rocm: the dashboard's telemetry daemon stopped serving:";
 
-/// The report's line pointing at the client log. dash-57 matches it without
-/// its leading `rocm: `.
+/// The report's line pointing at the client log. dash-57 and dash-60 match it
+/// without its leading `rocm: `.
 pub(crate) const REPORT_LOG_LINE: &str = "rocm: each failed attempt is logged in the files under";
 
-/// The warning the keeper logs for each failed run. dash-57 and dash-59 look
-/// for the fragment "could not serve its socket" from it in the client log.
+/// The warning the keeper logs for each failed run. dash-57, dash-59 and
+/// dash-60 look for the fragment "could not serve its socket" from it in the
+/// client log.
 #[cfg(unix)]
 pub(crate) const KEEPER_WARNING: &str =
     "embedded telemetry daemon could not serve its socket; retrying";
@@ -1086,7 +1184,7 @@ mod tests {
         let path = dir.path().join("rocmdashd.sock");
         let keeper = Keeper {
             socket: path.clone(),
-            handle: tokio::spawn(async { panic!("keeper bug") }),
+            handle: super::spawn_logging_panic(async { panic!("keeper bug") }),
             failure: std::sync::Arc::default(),
             served: std::sync::Arc::default(),
         };
@@ -1103,6 +1201,24 @@ mod tests {
         );
     }
 
+    /// A keeper that panics logs it from its own task, with the message, so it
+    /// is logged even when the process ends without [`stop_keeper`] (a signal
+    /// or a typed Ctrl-C); stopping it afterwards does not log it twice.
+    #[tokio::test]
+    async fn a_keeper_panic_is_logged_once_without_waiting_for_stop_keeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocmdashd.sock");
+        let (log, _guard) = log_at(tracing::Level::ERROR);
+
+        let keeper = panicked_keeper(&path, None).await;
+
+        let logged = || log.text().matches(super::KEEPER_PANICKED).count();
+        assert_eq!(logged(), 1, "{}", log.text());
+        assert!(log.text().contains("keeper bug"), "{}", log.text());
+        assert!(stop_keeper(keeper).await.is_some());
+        assert_eq!(logged(), 1, "stop_keeper does not log it again");
+    }
+
     /// A keeper whose task panicked, after its daemon served (`served`) or not.
     async fn keeper_that_panics(
         path: &Path,
@@ -1111,7 +1227,7 @@ mod tests {
     ) -> Keeper {
         let keeper = Keeper {
             socket: path.to_path_buf(),
-            handle: tokio::spawn(panics),
+            handle: super::spawn_logging_panic(panics),
             failure: std::sync::Arc::default(),
             served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(served)),
         };
@@ -1174,7 +1290,7 @@ mod tests {
     async fn panicked_keeper(path: &Path, recorded: Option<KeeperFailure>) -> Keeper {
         let keeper = Keeper {
             socket: path.to_path_buf(),
-            handle: tokio::spawn(async { panic!("keeper bug") }),
+            handle: super::spawn_logging_panic(async { panic!("keeper bug") }),
             failure: std::sync::Arc::new(std::sync::Mutex::new(recorded)),
             served: std::sync::Arc::default(),
         };
@@ -1544,6 +1660,43 @@ mod tests {
         );
 
         assert_eq!(stop_keeper(keeper).await, None);
+    }
+
+    /// On a forced exit the report is the one for the failure recorded then,
+    /// and there is none when nothing is recorded or a daemon answers at the
+    /// socket by then.
+    #[test]
+    fn the_forced_exit_report_is_the_recorded_failures_unless_a_daemon_answers() {
+        let failure = KeeperFailure {
+            socket: "/run/x.sock".into(),
+            error: "/run/x.sock exists and is not a socket".into(),
+            failed_attempts: 3,
+            served: false,
+            logged: true,
+        };
+        let log = Path::new(LOG_DIR);
+        let recorded = std::sync::Mutex::new(Some(failure.clone()));
+        let probed = std::cell::Cell::new(None);
+        let nobody = |socket: &Path| {
+            probed.set(Some(socket.to_path_buf()));
+            false
+        };
+
+        assert_eq!(
+            super::forced_exit_report(&recorded, log, nobody),
+            Some(failure_report(&failure, log))
+        );
+        assert_eq!(probed.take().as_deref(), Some(Path::new("/run/x.sock")));
+        assert_eq!(
+            super::forced_exit_report(&recorded, log, |_| true),
+            None,
+            "a daemon answers by then"
+        );
+        assert_eq!(
+            super::forced_exit_report(&std::sync::Mutex::new(None), log, |_| false),
+            None,
+            "nothing recorded"
+        );
     }
 
     /// The report counts failed attempts only from two on: "(1 failed

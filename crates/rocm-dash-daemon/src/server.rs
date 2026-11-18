@@ -405,6 +405,38 @@ pub async fn socket_answers(path: &std::path::Path) -> bool {
     )
 }
 
+/// [`socket_answers`] for a caller that cannot await.
+///
+/// That is a process about to exit on a signal, from a thread that may be a
+/// Tokio worker. The same probe, on blocking I/O, runs on a thread of its
+/// own, and this waits for its verdict at most [`STALE_PROBE_TIMEOUT`]; a
+/// probe still running then counts as answering, as a timed-out one does in
+/// [`socket_answers`]. A probe stuck past that is left to finish, or to end
+/// with the process.
+#[cfg(unix)]
+pub fn socket_answers_blocking(path: &std::path::Path) -> bool {
+    use std::io::{BufRead, Read};
+
+    let path = path.to_path_buf();
+    let (verdict, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let probe = || -> std::io::Result<()> {
+            let stream = std::os::unix::net::UnixStream::connect(&path)?;
+            stream.set_read_timeout(Some(STALE_PROBE_TIMEOUT))?;
+            let mut greeting = Vec::new();
+            // What it says, or whether it says anything, does not matter here.
+            let _ = std::io::BufReader::new(stream.take(PROBE_GREETING_LIMIT))
+                .read_until(b'\n', &mut greeting);
+            Ok(())
+        };
+        let _ = verdict.send(probe());
+    });
+    matches!(
+        probe_verdict(outcome.recv_timeout(STALE_PROBE_TIMEOUT).ok()),
+        ProbeVerdict::Answered
+    )
+}
+
 /// The lock file that says which daemon owns `socket`: the socket path with
 /// `.lock` appended, in the same directory.
 #[cfg(unix)]
@@ -850,6 +882,14 @@ async fn serve_unix(
                 }
             }
             _ = path_check.tick() => {
+                // `path_state` stats the socket path (`symlink_metadata`) on
+                // this serving task, blocking it for as long as the stat
+                // takes. Accepted on purpose: by default the socket lives in
+                // the user's local runtime or data directory
+                // (`dashboard_socket_path` in rocm-core's `config.rs`), where
+                // a stat returns at once. A socket path configured on a
+                // shared filesystem that hangs would stall this task with it;
+                // that case is tracked in ROCMAI-1152.
                 let check = match claim.path_state() {
                     PathState::Ours => Ok(()),
                     // Serving an inode nobody can reach would hold the lock,
@@ -1631,6 +1671,41 @@ mod tests {
             probe_verdict(Some(Err(Error::from(ErrorKind::PermissionDenied)))),
             ProbeVerdict::Failed(_)
         ));
+    }
+
+    /// The blocking probe a process uses on its way out gives the same
+    /// verdicts as the async one: a listener that greets, or one that never
+    /// does, answers; a stale socket and a missing path do not.
+    #[test]
+    fn the_blocking_probe_tells_an_answering_socket_from_a_stale_one() {
+        use std::io::Write;
+
+        use super::socket_answers_blocking;
+
+        let dir = tempfile::tempdir().unwrap();
+        let greeting = dir.path().join("greeting.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&greeting).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut client, _)) = listener.accept() {
+                let _ = client.write_all(b"{}\n");
+            }
+        });
+        assert!(socket_answers_blocking(&greeting), "a daemon that greets");
+
+        let silent = dir.path().join("silent.sock");
+        let _silent = std::os::unix::net::UnixListener::bind(&silent).unwrap();
+        assert!(
+            socket_answers_blocking(&silent),
+            "a listener that never greets"
+        );
+
+        let stale = dir.path().join("stale.sock");
+        stale_socket(&stale);
+        assert!(!socket_answers_blocking(&stale), "a stale socket");
+        assert!(
+            !socket_answers_blocking(&dir.path().join("missing.sock")),
+            "a missing path"
+        );
     }
 
     /// The probe of an answering daemon stays for its greeting, so the daemon

@@ -1039,9 +1039,19 @@ async fn run_async(
         None
     };
 
+    // A signal or a typed Ctrl-C ends the process inside the TUI, so the
+    // report after `run` below never runs on those exits; this prints it from
+    // there instead. Dropped as soon as `run` returns, so after that only the
+    // report below is printed -- except for a signal that resolved in the
+    // instant before `run` cancelled its watcher (see `set_pre_exit_hook` in
+    // rocm-dash-tui's `app/terminal.rs`), which can print it once more.
+    let report_on_forced_exit = keeper
+        .as_ref()
+        .map(|keeper| crate::dash_daemon::report_on_forced_exit(keeper, paths.client_log_dir()));
     let result = rocm_dash_tui::app::run(args)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()));
+    drop(report_on_forced_exit);
 
     // Stop this dashboard's keeper before the runtime goes. If it owned the
     // daemon, that removes the daemon's socket so another open dashboard can

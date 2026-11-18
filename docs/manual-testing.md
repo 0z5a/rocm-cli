@@ -1420,6 +1420,13 @@ Expected result:
   main screen once it has restored the terminal, and the launcher then
   switches back to its own alternate screen, a separate buffer, so the lines
   are seen when the launcher itself exits.
+- The same report is printed when that dashboard is ended with Ctrl-C instead
+  of quit (exit code 130), or with `kill -INT` or `kill -TERM` from another
+  terminal (130 or 143): the terminal is restored first and the lines follow
+  it. A crash of the dashboard's own supervision of its telemetry daemon is
+  not reported on these exits; it is still in the client log, which the
+  supervising task writes as it crashes (`spawn_logging_panic` in
+  [dash_daemon.rs](../apps/rocm/src/dash_daemon.rs)).
 - A daemon that served and then stopped is reported after quitting as having
   *stopped serving* rather than as unable to start. To see it, give a single
   dashboard a throwaway socket directory of your own rather than your real
@@ -1430,7 +1437,8 @@ Expected result:
   its own). Do not run this as root, which `chmod 000` does not stop. Nothing is
   reported when, by the time the dashboard closes, another dashboard's daemon
   serves the socket -- except a crash of the dashboard's own supervision of
-  its telemetry daemon, which is always reported.
+  its telemetry daemon, which is always reported when the dashboard is quit
+  (on Ctrl-C or a signal it is only logged; see the bullet above).
 - A `unix:` socket path set in `dashboard.tui.connect` in `config.json` has
   its directory restricted to mode `0700` when you own that directory and it
   is not sticky (a sticky one such as `/tmp` keeps its mode), so point it at

@@ -60,7 +60,7 @@ mod update_check;
 pub(crate) use actions::request_quit;
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub use event_loop::run;
-pub use terminal::spawn_termination_watcher;
+pub use terminal::{PreExitHookGuard, set_pre_exit_hook, spawn_termination_watcher};
 pub(crate) use terminal::{
     SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer, restore_terminal,
     shutdown_claimed_on,

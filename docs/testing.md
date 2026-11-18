@@ -4970,6 +4970,8 @@ since serving a bare name would change the process-wide current directory
 under parallel tests),
 a probe that stays for the greeting (`the_probe_waits_for_the_greeting_before_hanging_up`)
 and reads at most a bounded amount of it (`the_probe_reads_a_bounded_greeting_from_a_listener_that_never_ends_a_line`),
+the blocking probe a process uses on its way out, with the same verdicts
+(`the_blocking_probe_tells_an_answering_socket_from_a_stale_one`),
 a serving daemon whose socket is replaced (`a_daemon_whose_socket_is_replaced_gives_up_the_path`)
 or briefly cannot be checked (`a_daemon_keeps_serving_while_its_path_briefly_cannot_be_checked`)
 or stays unreadable (`a_daemon_gives_its_path_up_when_it_stays_unreadable`; run as root,
@@ -5006,8 +5008,13 @@ daemon has failed (`the_ready_wait_ends_at_once_when_the_daemon_has_failed`) and
 after its limit otherwise (`the_ready_wait_gives_up_after_its_limit`), the retry waits
 (`a_failing_daemon_backs_off_and_finding_an_owner_resets_it`), a removed socket
 served again without a failure (`a_removed_socket_is_served_again_without_a_failure`),
-the report's count (`the_report_counts_failed_attempts_from_two`), and a
-non-unix target starts no keeper. The keeper's timing is checked with the
+the report's count (`the_report_counts_failed_attempts_from_two`), a keeper
+panic logged once, by the keeper's own task, without waiting for `stop_keeper`
+(`a_keeper_panic_is_logged_once_without_waiting_for_stop_keeper`), the report
+on a forced exit -- the recorded failure's, and none when nothing is recorded
+or a daemon answers by then
+(`the_forced_exit_report_is_the_recorded_failures_unless_a_daemon_answers`) --
+and a non-unix target starts no keeper. The keeper's timing is checked with the
 daemon scripted, on tokio's paused clock: failed runs spaced by the growing
 backoff (`failed_runs_are_spaced_by_the_growing_backoff`), a daemon that keeps
 stopping soon after it starts serving backed off rather than restarted every
@@ -5040,15 +5047,25 @@ warning was logged (and the log to hold it), and to leave the file in place;
 `dash-59` makes the socket's directory unreadable under a serving daemon,
 waits until the daemon gives the socket up, requires the dashboard to show it
 is disconnected and, after it closes, to report that its telemetry daemon
-stopped serving (naming the socket), not that it could not start. `dash-56`
-to `dash-58` carry only `@requires-os:linux`, so they run on every Linux lane,
-GPU or not, and are skipped on Windows; `dash-59` also carries
+stopped serving (naming the socket), not that it could not start; `dash-60`
+sets up as `dash-57` does but ends the dashboard with a typed Ctrl-C, and
+requires exit code 130, the same report and log line, and the file left in
+place, so it fails if the forced-exit path stops running the pre-exit hook;
+`dash-61` and `dash-62` do the same with a SIGTERM (exit code 143) and an
+externally delivered SIGINT (130), which end the process from the signal
+watcher instead, so they fail if that path stops running the hook
+(`set_pre_exit_hook` in
+[app/terminal.rs](../crates/rocm-dash-tui/src/app/terminal.rs), whose
+`a_pre_exit_hook_runs_once_and_not_after_it_is_cleared` covers it running
+once and never after its guard is dropped). `dash-56` to `dash-58` and
+`dash-60` to `dash-62` carry only `@requires-os:linux`, so they run on every
+Linux lane, GPU or not, and are skipped on Windows; `dash-59` also carries
 `@requires-dir-permissions`, since a directory permission does not bind root,
 and is skipped where the suite runs as root. Each simulates a GPU-less host
 itself (as `dash-37` does), so the runner's GPU does not change the outcome:
 
 ```bash
-cargo xtask e2e -- -n "dash-5[6-9]"
+cargo xtask e2e -- -n "dash-(5[6-9]|6[0-2])"
 ```
 
 ## Diagnose Engine Provenance

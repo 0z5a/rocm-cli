@@ -1071,3 +1071,48 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
     And the dashboard reports that its telemetry daemon stopped serving
+
+  # The same report when the dashboard is ended with Ctrl-C instead of quit.
+  # A typed Ctrl-C, like a SIGINT or SIGTERM, ends the process inside the
+  # dashboard, so nothing after it in `rocm dash` runs; the report is printed
+  # from that exit path instead, once the terminal is restored. Same setup as
+  # dash-57; the dashboard is drawn (and so in raw mode, where Ctrl-C is a key)
+  # before the keystroke is sent.
+  @id:dash-reports-unusable-telemetry-socket-on-ctrl-c @requires-os:linux
+  Scenario: dash-60 - A dashboard ended with Ctrl-C still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The same report when the dashboard is ended by a SIGTERM (a supervisor
+  # stopping it): the signal watcher ends the process inside the dashboard and
+  # prints the report from there, as for dash-60. Same setup as dash-57.
+  @id:dash-reports-unusable-telemetry-socket-on-sigterm @requires-os:linux
+  Scenario: dash-61 - A dashboard ended by a SIGTERM still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the dashboard receives a SIGTERM
+    Then the dashboard exits from the signal with code 143
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
+
+  # The same for an externally delivered SIGINT (`kill -INT`), which takes the
+  # signal watcher's path, not the typed Ctrl-C of dash-60. Same setup as
+  # dash-57.
+  @id:dash-reports-unusable-telemetry-socket-on-sigint @requires-os:linux
+  Scenario: dash-62 - A dashboard ended by a SIGINT still says why its telemetry daemon could not start
+    Given a machine with no GPU
+    And a file that is not a socket sits where the dashboard's telemetry socket goes
+    When the user opens the dashboard
+    Then the dashboard shows it is disconnected from its telemetry daemon
+    When the dashboard receives a SIGINT
+    Then the dashboard exits from the signal with code 130
+    And the dashboard reports that its telemetry daemon could not use that file
+    And that file is left in place
