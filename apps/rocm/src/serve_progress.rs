@@ -763,8 +763,10 @@ const REDACTED: &str = "[redacted]";
 /// one ASCII line with single spaces. Masked: the endpoint key wherever it
 /// appears, the value after a secret-named flag or key (`--api-key X`,
 /// `api_key=X`, `'api_key': 'X'`, `"api_key":"X"`, `Authorization: Bearer X`),
-/// and Hugging Face `hf_` tokens. A list value (`'api_key': ['a', 'b']`) has
-/// only its first item masked.
+/// and Hugging Face `hf_` tokens. A value that opens a quote or a list and
+/// closes it in a later word (`--password 'two words'`,
+/// `'api_key': ['a', 'b']`) is masked through its closing quote or bracket,
+/// or to the end of the line if it never closes.
 pub(crate) fn redact_log_line(line: &str, endpoint_api_key: Option<&str>) -> String {
     let line = match endpoint_api_key.filter(|key| !key.is_empty()) {
         Some(key) => line.replace(key, REDACTED),
@@ -772,12 +774,28 @@ pub(crate) fn redact_log_line(line: &str, endpoint_api_key: Option<&str>) -> Str
     };
     let mut out: Vec<String> = Vec::new();
     let mut mask_next = false;
+    // A secret value that spans words: the text before it, the words so far,
+    // and the character that closes it.
+    let mut group: Option<(String, String, char)> = None;
     for word in line.split(' ') {
+        if let Some((prefix, value, closer)) = group.as_mut() {
+            value.push(' ');
+            value.push_str(word);
+            if word.contains(*closer) {
+                out.push(format!("{prefix}{}", mask_value(value)));
+                group = None;
+            }
+            continue;
+        }
         if mask_next {
             mask_next = false;
             if word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("basic") {
                 out.push(word.to_owned());
                 mask_next = true;
+                continue;
+            }
+            if let Some(closer) = unclosed_group(word) {
+                group = Some((String::new(), word.to_owned(), closer));
                 continue;
             }
             out.push(mask_value(word));
@@ -786,6 +804,10 @@ pub(crate) fn redact_log_line(line: &str, endpoint_api_key: Option<&str>) -> Str
         if let Some((name, value)) = word.split_once('=')
             && is_secret_name(name)
         {
+            if let Some(closer) = unclosed_group(value) {
+                group = Some((format!("{name}="), value.to_owned(), closer));
+                continue;
+            }
             out.push(if value.is_empty() {
                 format!("{name}=")
             } else {
@@ -812,7 +834,24 @@ pub(crate) fn redact_log_line(line: &str, endpoint_api_key: Option<&str>) -> Str
         }
         out.push(word.to_owned());
     }
+    // A group that never closed is masked to the end of the line.
+    if let Some((prefix, value, _)) = group {
+        out.push(format!("{prefix}{}", mask_value(&value)));
+    }
     out.join(" ")
+}
+
+/// The closing character of a quote or list that `value` opens and does not
+/// close (`'two` -> `'`, `['a',` -> `]`), or `None` for a one-word value.
+fn unclosed_group(value: &str) -> Option<char> {
+    let body = value.trim_start_matches('(');
+    let opener = body.chars().next()?;
+    let closer = match opener {
+        '[' => ']',
+        '\'' | '"' => opener,
+        _ => return None,
+    };
+    (!body[opener.len_utf8()..].contains(closer)).then_some(closer)
 }
 
 /// Whether `word` names a secret (`--api-key`, `HF_TOKEN`, `'api_key':`,
@@ -2084,6 +2123,25 @@ mod tests {
             (
                 "launch --secret-key abc123 --private-key def456 --port 8000",
                 "launch --secret-key [redacted] --private-key [redacted] --port 8000",
+            ),
+            // A value spanning words is masked through its closing quote or
+            // bracket, not only its first word.
+            (
+                "Namespace(api_key='my secret value', port=8000)",
+                "Namespace(api_key='[redacted]', port=8000)",
+            ),
+            (
+                "launch --password \"two words\" --port 8000",
+                "launch --password \"[redacted]\" --port 8000",
+            ),
+            (
+                "args: {'api_key': ['first', 'second'], 'port': 8000}",
+                "args: {'api_key': ['[redacted]'], 'port': 8000}",
+            ),
+            // One that never closes is masked to the end of the line.
+            (
+                "launch --password 'never closed here",
+                "launch --password '[redacted]",
             ),
             // A value ending in a multi-byte character is cut at a character
             // boundary, not one byte past the start of that character.
