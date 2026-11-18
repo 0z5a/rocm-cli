@@ -288,23 +288,23 @@ async fn another_daemon_serves(socket: &Path) -> bool {
     false
 }
 
-/// How the report opens for a daemon that never served the socket. dash-56
+/// How the report opens for a daemon that never served the socket. dash-57
 /// (`dash_steps.rs`), which cannot import it, matches its tail from
 /// "telemetry daemon".
 pub(crate) const REPORT_COULD_NOT_START: &str =
     "rocm: the dashboard's telemetry daemon could not start:";
 
 /// How the report opens for a daemon that served the socket and then
-/// stopped (and has not served it again since). dash-58 (`dash_steps.rs`)
+/// stopped (and has not served it again since). dash-59 (`dash_steps.rs`)
 /// matches its tail from "telemetry daemon".
 pub(crate) const REPORT_STOPPED_SERVING: &str =
     "rocm: the dashboard's telemetry daemon stopped serving:";
 
-/// The report's line pointing at the client log. dash-56 matches it without
+/// The report's line pointing at the client log. dash-57 matches it without
 /// its leading `rocm: `.
 pub(crate) const REPORT_LOG_LINE: &str = "rocm: each failed attempt is logged in the files under";
 
-/// The warning the keeper logs for each failed run. dash-56 and dash-58 look
+/// The warning the keeper logs for each failed run. dash-57 and dash-59 look
 /// for the fragment "could not serve its socket" from it in the client log.
 #[cfg(unix)]
 pub(crate) const KEEPER_WARNING: &str =

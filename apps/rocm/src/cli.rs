@@ -13,8 +13,8 @@
 //! keeps reaching them as `crate::Command`, `crate::Provider` and so on.
 
 pub(crate) use crate::cli_args::{
-    DevicePolicyArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider, SandboxToolArg,
-    TelemetryModeArg, WatcherModeArg,
+    DevicePolicyArg, DiagnoseEngineArg, FrameworkArg, InstallFormat, PermissionsModeArg, Provider,
+    SandboxToolArg, TelemetryModeArg, WatcherModeArg,
 };
 use crate::service_records::DEFAULT_SERVICE_PRUNE_MIN_AGE_HOURS;
 use crate::{bootstrap, chat, comfyui, remote, storage};
@@ -23,8 +23,13 @@ use rocm_core::DEFAULT_LOCAL_HOST;
 use std::path::PathBuf;
 
 /// User-selectable serving engines, in the order shown in `--help` and shell
-/// completions. Used as the clap `value_parser` for every user-facing `--engine`
-/// argument so the possible values stay in sync across the CLI surface.
+/// completions. Used as the clap `value_parser` for every user-facing argument
+/// that names an engine to serve, install, open a shell in or set as a
+/// preference (`serve --engine`, `engines install`/`shell`, and the
+/// engine-setting `config` commands), so the possible values stay in sync
+/// across those commands.
+/// `diagnose --engine` is narrower on purpose: it takes `DiagnoseEngineArg`,
+/// only the engines the diagnosis catalog tells apart.
 pub(crate) const SUPPORTED_ENGINES: [&str; 3] = ["lemonade", "vllm", "aim"];
 
 #[derive(Parser, Debug)]
@@ -103,7 +108,14 @@ pub(crate) enum Command {
         ///
         /// Each match then says whether this text contributed to it
         /// (`symptom_matched` in --json).
-        #[arg(long, value_name = "TEXT")]
+        //
+        // `symptom_source` groups the two symptom flags for `--engine`, which
+        // needs a symptom from either. A plain `requires = "symptom"` also let
+        // `--symptom-file` through, but only because clap waives a requirement
+        // on an argument that conflicts with one present; the group says what
+        // is meant. It does not change how the two flags refuse each other:
+        // `--symptom-file`'s own `conflicts_with` still does that.
+        #[arg(long, value_name = "TEXT", group = "symptom_source")]
         symptom: Option<String>,
         /// Read the error text from a file instead, or from standard input
         /// when PATH is `-`, so no shell quoting is needed. A file named `-`
@@ -121,8 +133,33 @@ pub(crate) enum Command {
         /// text to a program as ASCII, turning any other character into `?`.
         /// With nothing piped in, paste the text at the terminal and end it
         /// with Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows).
-        #[arg(long, value_name = "PATH", conflicts_with = "symptom")]
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "symptom",
+            group = "symptom_source"
+        )]
         symptom_file: Option<PathBuf>,
+        /// The engine the symptom came from (`--symptom` or `--symptom-file`),
+        /// so it can be matched as that engine's error without editing it.
+        ///
+        /// Some failure modes belong to one engine, and the error it prints
+        /// (a PyTorch out-of-memory error, for one) is the same text any other
+        /// program could print. Without this, such an entry matches only a
+        /// line that names the engine itself. With it, every non-blank line of
+        /// the symptom is taken as that engine's, the symptom is used exactly
+        /// as given (from a file, as read: one trailing line break removed),
+        /// and the JSON diagnosis records both under `provenance` (exactly,
+        /// once the JSON is decoded: on the wire `--json` is ASCII, with any
+        /// non-ASCII character written as a `\uXXXX` escape). The text
+        /// report opens with a line naming the engine, and says the flag
+        /// changed nothing where no entry on this OS reads that engine (native
+        /// Windows has no vLLM entry).
+        /// A `--report` never carries either: it names only the cause the
+        /// diagnosis established. Only engines the catalog tells apart are
+        /// accepted; writing `vllm` in the symptom text still works as before.
+        #[arg(long, value_enum, value_name = "ENGINE", requires = "symptom_source")]
+        engine: Option<DiagnoseEngineArg>,
         /// Show at most this many matches (default 5).
         #[arg(long, default_value_t = 5)]
         top: usize,
@@ -236,7 +273,18 @@ pub(crate) enum Command {
     /// problem and changes nothing (`info-20-gpu-no-rocm-support` is the entry
     /// marked that way today: a GPU ROCm has no runtime build for is a fact
     /// about the hardware, not something to put right).
-    /// Use `--dry-run` to see any fix's plan without changing anything.
+    /// Use `--dry-run` to see a fix's plan without changing anything.
+    ///
+    /// A fix whose command fails exits 4 and says why on stderr. A command that
+    /// does not finish within its time limit is stopped and also exits 4; the
+    /// change may then be partial, so the message names how to check it and the
+    /// `rocm fix` command to re-run. On Windows, `fix-2-unset-override`,
+    /// `fix-6-path` and `fix-9-igpu-dgpu --device-index N` read the current
+    /// value of the variable they change before planning; when that read
+    /// fails they stop before changing anything, with exit 4. Under
+    /// `--dry-run` they stop the same way and show no plan; the catalog entry
+    /// printed first is the fix's generic description, not a preview of the
+    /// change on this machine.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
@@ -247,7 +295,11 @@ pub(crate) enum Command {
         /// Fixes that only print steps never ask.
         #[arg(long)]
         yes: bool,
-        /// Show the plan without changing anything.
+        /// Show the plan without changing anything. On Windows, a dry run of a
+        /// fix that reads the current value of the variable it would change
+        /// stops with exit 4 and shows no plan when that read fails; the
+        /// catalog entry printed first is the fix's generic description, not a
+        /// preview of the change on this machine.
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
@@ -999,7 +1051,11 @@ pub(crate) enum RuntimesCommand {
     /// generation and exact GPU target as its manifest recorded them. A fact
     /// recorded nowhere, or recorded blank, is shown as `unrecorded`; nothing
     /// is guessed from other facts.
-    List,
+    List {
+        /// Print the runtime list as JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Use the selected ROCm runtime by default.
     Activate {
         /// Runtime key or friendly runtime selector.
@@ -2011,6 +2067,62 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
+    // `--engine` names where a symptom came from (ROCMAI-955). It takes only
+    // the engines the catalog tells apart, so an engine `serve` knows but the
+    // catalog does not is a usage error rather than a value silently ignored,
+    // and without a symptom it would describe nothing. The symptom may come
+    // from either `--symptom` or `--symptom-file`.
+    #[test]
+    fn diagnose_engine_takes_the_engines_the_catalog_tells_apart() {
+        let cli = parse_diagnose(&["--symptom", "torch.OutOfMemoryError", "--engine", "vllm"])
+            .expect("vllm parses");
+        match cli.command {
+            Some(Command::Diagnose {
+                engine, symptom, ..
+            }) => {
+                assert_eq!(
+                    engine.map(rocm_core::SymptomEngine::from),
+                    Some(rocm_core::SymptomEngine::Vllm)
+                );
+                assert_eq!(symptom.as_deref(), Some("torch.OutOfMemoryError"));
+            }
+            other => panic!("expected diagnose, got {other:?}"),
+        }
+        for unknown in ["lemonade", "aim", "llama.cpp", "VLLM-ish"] {
+            let error = parse_diagnose(&["--symptom", "x", "--engine", unknown])
+                .expect_err("an engine the catalog does not tell apart must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{unknown}"
+            );
+            assert!(error.to_string().contains("vllm"), "{error}");
+        }
+        for path in ["-", "error.txt"] {
+            match parse_diagnose(&["--symptom-file", path, "--engine", "vllm"]) {
+                Ok(Cli {
+                    command:
+                        Some(Command::Diagnose {
+                            engine,
+                            symptom_file,
+                            ..
+                        }),
+                    ..
+                }) => {
+                    assert_eq!(engine, Some(DiagnoseEngineArg::Vllm));
+                    assert_eq!(symptom_file, Some(PathBuf::from(path)));
+                }
+                other => panic!("--symptom-file {path} --engine vllm must parse, got {other:?}"),
+            }
+        }
+        let error = parse_diagnose(&["--engine", "vllm"])
+            .expect_err("an engine with no symptom describes nothing");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
     // The context options describe the model being asked about, so without
     // `--model` they would be accepted and silently do nothing.
     #[test]
@@ -2140,6 +2252,24 @@ mod tests {
             }) => assert_eq!(runtime, "release-pip-x"),
             other => panic!("expected runtimes activate, got {other:?}"),
         }
+    }
+
+    /// `--json` belongs to `list` alone: bare `rocm runtimes` stays the text
+    /// listing, so a script has to name the subcommand to get JSON.
+    #[test]
+    fn runtimes_json_is_a_list_flag() {
+        for (args, json) in [(&["list", "--json"][..], true), (&["list"][..], false)] {
+            match parse_runtimes(args).expect("runtimes list parses").command {
+                Some(Command::Runtimes {
+                    command: Some(RuntimesCommand::List { json: parsed }),
+                }) => assert_eq!(parsed, json, "{args:?}"),
+                other => panic!("expected runtimes list, got {other:?}"),
+            }
+        }
+        assert!(
+            parse_runtimes(&["--json"]).is_err(),
+            "`rocm runtimes --json` must be rejected, not read as `list --json`"
+        );
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {

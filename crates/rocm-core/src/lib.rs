@@ -105,8 +105,9 @@ pub use crypto::{
     verify_rsa_pkcs1_sha256_signature,
 };
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, Route, VLLM_IMPORT_CANONICAL_SYMPTOM,
-    VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, Route, SymptomEngine, SymptomProvenance,
+    VLLM_IMPORT_CANONICAL_SYMPTOM, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    diagnose_with_engine as run_diagnose_with_engine, render_report_json as render_diagnose_json,
     render_report_text as render_diagnose_text, vllm_import_symptom_is_diagnosable,
     vllm_oom_symptom_is_diagnosable,
 };
@@ -141,6 +142,7 @@ pub use gfx_target::{
     normalize_therock_family,
 };
 pub use hardware_root::host_path;
+pub use host_gpu::ldconfig_cache;
 pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WSL_ROCDXG_READY, WindowsGpuListing,
     WslHostDriverProbe, WslSummary, default_engine_for_host, default_engine_for_platform,
@@ -153,7 +155,7 @@ pub use host_gpu::{
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
 use host_gpu::{
     detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
-    detect_wsl_summary, is_wsl1_kernel, ldconfig_cache, ldconfig_lists_librocdxg,
+    detect_wsl_summary, is_wsl1_kernel, ldconfig_lists_librocdxg,
 };
 pub use jsonl_store::jsonl_lock_path;
 pub use log_tail::{

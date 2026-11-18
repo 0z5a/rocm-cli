@@ -215,6 +215,11 @@ Feature: Diagnosing failures and listing fixes
   # `fix-4-render-group`'s `applies_on` does not include `wsl`, so on a WSL2
   # host the CLI refuses it as the wrong platform before ever invoking the
   # (faked) `usermod` — there is no command-failure branch to reach there.
+  #
+  # The Then step also holds the claim against the state: the stand-in records
+  # that it was asked to add the user to the groups, and the success line is
+  # absent, so "NOT changed" is said about a change that was attempted and
+  # refused, not about one that never ran or quietly went through.
   @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux @requires-bare-metal
   Scenario: diagnose-15 - A fix whose helper command fails explains why, on stderr, with exit code 4
     Given a user who has approved a fix whose helper command will fail
@@ -610,7 +615,8 @@ Feature: Diagnosing failures and listing fixes
   # `ps_env_scope`'s doc comment names -- "PowerShell missing") rather than
   # faking the read failing, so the abort this proves is a real one, not a
   # simulated one, and it never touches the real User PATH at all, so no
-  # capture/restore is needed here.
+  # capture/restore is needed here. diagnose-69 and diagnose-70 hold fix-2 and
+  # fix-9 to the same rule.
   @id:diagnose-fix-path-aborts-on-unreadable-user-path @requires-os:windows
   Scenario: diagnose-39 - A fix-6-path run that cannot read the real User PATH aborts instead of wiping it
     Given a Windows host with a HIP SDK install and no way to resolve PowerShell
@@ -909,7 +915,8 @@ Feature: Diagnosing failures and listing fixes
   # paste is diagnosed (not investigated further; the console is started with
   # cursor inheritance, which waits on a reply the screen emulator does not
   # send). That leaves the Windows half of the hint (Ctrl-Z then Enter) without
-  # an e2e check; docs/manual-testing.md section 13 covers it by hand.
+  # an e2e check; docs/manual-testing.md's "Pasting An Error Into `rocm diagnose`"
+  # section covers it by hand.
   @id:diagnose-a-paste-at-the-terminal-is-explained-and-diagnosed @requires-os:linux
   Scenario: diagnose-60 - Pasting the error at the terminal is explained, and the paste is diagnosed when the user ends it
     Given a pasted error containing quotes, a command substitution and a leading minus sign
@@ -996,3 +1003,167 @@ Feature: Diagnosing failures and listing fixes
   Scenario: diagnose-67 - Diagnosing a failed load of the ROCm runtime library names the release the framework and the system must share
     When the user diagnoses this machine with a ROCm runtime library load failure
     Then the wheel mismatch cause and its plan name the X.Y release, not the major version
+
+  # The sibling of diagnose-15 the reported bug was about: the helper command
+  # never finishes. The CLI stops it at the fix's one-minute bound, but it can
+  # only stop the command it started (`sudo`), so the change may still have
+  # been made. Before ROCMAI-345 this was reported as "usermod exited 124;
+  # group membership NOT changed." -- naming no timeout and claiming a state
+  # nobody had checked. The stand-in records its arguments and then sleeps far
+  # past the bound, so the scenario waits out the real minute: there is no
+  # test-only way to shorten it, on purpose, so the bound under test is the one
+  # users get. Same lane as diagnose-15, for the same reasons.
+  @id:diagnose-fix-command-timeout-says-change-may-be-partial @requires-os:linux @requires-bare-metal
+  Scenario: diagnose-68 - A fix whose helper command never finishes says the change may be partial and how to check it
+    Given a user who has approved a fix whose helper command never finishes
+    When the user asks the CLI to apply the approved fix
+    Then the CLI reports on stderr, with exit code 4, that the helper was stopped after a minute, how to check the change and which fix to re-run
+    And the CLI claims neither that the change was made nor that nothing changed
+    And the helper was asked to add the user to the render and video groups
+
+  # A User-scope read that cannot complete used to be taken as "not set": with
+  # nothing in the Machine scope either, fix-2 printed that no persistent
+  # override was found and the user was done, and exited 0, on a machine that
+  # may still carry it. Same real "PowerShell missing" cause as diagnose-39.
+  # Applied for real: should the guard regress, both reads would read as unset
+  # and fix-2 would find nothing to clear, so the runner's User environment is
+  # never written.
+  @id:diagnose-fix-override-aborts-on-unreadable-user-scope @requires-os:windows
+  Scenario: diagnose-69 - Clearing the GPU override stops when the saved value cannot be read, instead of calling it gone
+    Given a Windows host where PowerShell cannot be found
+    And a user who has chosen the fix for the GPU override
+    When the user asks the CLI to apply the approved fix
+    Then the CLI stops with exit code 4, saying it could not read the saved override and that nothing was changed
+    And the CLI does not report the override as already gone
+
+  # The same failed read made fix-9 skip its "already set" guard and overwrite
+  # a User-scope device setting the user may have chosen on purpose. Previewed
+  # rather than applied: the empty PATH hides PowerShell but not setx.exe, so
+  # an applied fix-9 whose guard regressed would set HIP_VISIBLE_DEVICES on the
+  # runner itself, with nothing to restore it. The preview reads the setting
+  # before planning, the same way the apply does, and a preview never runs
+  # setx. So this holds the stop and what the preview prints: the catalog entry
+  # still appears, the change it would make does not. That an applied fix-9
+  # writes nothing after a failed read is held by the unit tests in
+  # fix/runners.rs (`pin_device_read_timeout_stops_before_setx`,
+  # `a_read_that_exits_non_zero_stops_every_windows_fix_without_writing`).
+  @id:diagnose-fix-igpu-aborts-on-unreadable-user-scope @requires-os:windows
+  Scenario: diagnose-70 - A dry run of the discrete-GPU pin that cannot read the saved device setting stops with exit code 4 and previews no change
+    Given a Windows host where PowerShell cannot be found
+    And a user who has chosen the fix that hides the integrated GPU
+    When the user previews that fix for the second GPU
+    Then the CLI stops with exit code 4, saying it could not read the saved device setting and that nothing was changed
+    And the fix's catalog entry is printed, but not the device setting it would save
+
+  # ROCMAI-955. A vLLM error is often an ordinary PyTorch line that does not say
+  # vLLM, and the vLLM entry will not claim a line that does not, so the
+  # rocm-doctor skill tells an agent to write `vllm: ` in front of the user's
+  # paste (it moves to naming the engine in a later change). The user can now
+  # say where the paste came from instead, and the paste is used, and reported,
+  # exactly as given. @requires-os:linux for the reason given on
+  # diagnose-36: the vLLM entry is not in the native Windows catalog. Writing
+  # `vllm` into the paste still matches as before; diagnose-36 covers that form.
+  @id:diagnose-named-engine-matches-the-paste-unedited @requires-os:linux
+  Scenario: diagnose-71 - A pasted vLLM error is matched as vLLM's when the user names the engine, and not edited
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from
+    Then the diagnosis identifies the vLLM startup OOM
+    And the symptom in the report is exactly what the user pasted
+
+  # The record of where the paste came from does not depend on whether this
+  # machine's catalog has an entry for that engine, so it holds on every lane,
+  # native Windows included.
+  @id:diagnose-named-engine-is-recorded-in-the-report
+  Scenario: diagnose-72 - The report says which engine the user named and keeps the paste as given
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming vLLM as the engine it came from
+    Then the report says the user named vLLM as the source of the symptom
+    And the symptom in the report is exactly what the user pasted
+
+  # Only the engines the catalog tells apart are accepted. An engine `rocm
+  # serve` knows but the catalog does not would change nothing, so it is
+  # refused rather than accepted and silently ignored.
+  @id:diagnose-unknown-engine-is-refused
+  Scenario: diagnose-73 - Naming an engine the diagnosis cannot tell apart is refused
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom, naming an engine the diagnosis does not know
+    Then the CLI refuses the engine, names the ones it accepts, and diagnoses nothing
+
+  # `--engine` makes the diagnosis repeat the user's paste, verbatim, and
+  # `--report` is built from that diagnosis. A paste can carry the user's own
+  # paths and host names, and the report is the document printed for mailing,
+  # so the paste must not reach it: the report names the cause it established
+  # and nothing the user typed. The machine is simulated as in diagnose-58, a
+  # Linux host whose only GPU is on the compatibility matrix, so a real report
+  # is prepared on every Linux lane (WSL2 included, GPU or not) and the check
+  # runs against it, not against a refusal that never quotes the paste. Native
+  # Windows cannot be simulated this way; the payload unit test
+  # `a_shared_report_never_carries_the_pasted_symptom_or_its_provenance` holds
+  # the same property on every platform.
+  @id:diagnose-named-engine-paste-stays-out-of-the-report @requires-os:linux
+  Scenario: diagnose-74 - A report asked for with a named engine carries nothing the user pasted
+    Given a simulated Linux machine whose only GPU is a released one
+    And a user who pasted a vLLM error that names their own machine
+    When the user asks the CLI what a report would carry, naming vLLM as the engine the error came from
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+    And nothing the user pasted appears in what the CLI printed
+
+  # `--engine` needs a symptom, and `--symptom-file` supplies one as much as
+  # `--symptom` does, so the two are accepted together. The paste is piped in
+  # with the line break a shell or editor adds at the end; the symptom the
+  # report records is the text as `--symptom-file` reads it, with that one line
+  # break removed and nothing else changed. Holds on every lane: the record of
+  # where the paste came from does not depend on this machine's catalog.
+  @id:diagnose-named-engine-takes-a-piped-paste
+  Scenario: diagnose-75 - A vLLM error piped to the diagnosis is taken as vLLM's when the user names the engine
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user pipes it to the diagnosis, naming vLLM as the engine it came from
+    Then the report says the user named vLLM as the source of the symptom
+    And the symptom in the report is exactly what the user pasted
+
+  # The text report says which engine `--engine` named, and whether any entry on
+  # this machine reads it. Linux and WSL2 have the vLLM out-of-memory entry, so
+  # the line says the symptom was read as vLLM's, and the step checks that
+  # the vLLM entry is in the report. Native Windows has no vLLM entry, so the
+  # line says the flag changed nothing (diagnose-77), and that step checks that
+  # the report is otherwise the one the same paste gets without the flag. The
+  # line is derived from the catalog table the checks run from, not from a list
+  # of operating systems, so each half runs on the lanes its claim is about.
+  @id:diagnose-named-engine-is-stated-in-the-text-report @requires-os:linux
+  Scenario: diagnose-76 - The text report names the engine and says the symptom was read as that engine's
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from
+    Then the report says the symptom was read as vLLM's, and the vLLM out-of-memory cause is reported
+
+  @id:diagnose-named-engine-without-an-entry-says-it-changed-nothing @requires-os:windows
+  Scenario: diagnose-77 - On a machine with no entry for the named engine, the text report says the flag changed nothing
+    Given a user who pasted a vLLM out-of-memory error that does not name vLLM
+    When the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from
+    Then the report says no entry for vLLM exists on this OS, and the diagnosis is the one without the flag
+
+  # `provenance.symptom` repeats the paste verbatim, and a paste can hold text
+  # no catalog message does: an accented path, the box-drawing characters a
+  # `rich` traceback frames itself with, an emoji. On a Windows console using
+  # the OEM code page raw UTF-8 shows as mojibake, so `--json` is ASCII on the
+  # wire: each non-ASCII character is written as a `\u` escape, which every JSON
+  # parser decodes back to the identical text. Holds on every lane. The paste
+  # goes in through a file because a shell would get to it first otherwise.
+  @id:diagnose-named-engine-json-is-ascii-and-keeps-the-paste
+  Scenario: diagnose-78 - A pasted error with non-ASCII text is printed as ASCII JSON and reads back unchanged
+    Given a user whose pasted vLLM error contains non-ASCII text, saved to a file
+    When the user asks the CLI to diagnose that file in machine-readable form, naming vLLM as the engine
+    Then every byte the CLI printed is ASCII
+    And the symptom in the report reads back exactly as the file held it
+
+  # The line in diagnose-76 says how the symptom was read, not that it matched.
+  # With an error that has nothing to do with vLLM (a plain Python traceback)
+  # the same line appears, and the report holds no vLLM cause: naming the engine
+  # never makes a paste match on its own. Linux and WSL2, where the vLLM entry
+  # exists and so reads the engine; native Windows says the flag changed nothing
+  # instead (diagnose-77).
+  @id:diagnose-named-engine-claims-no-match-for-an-unrelated-paste @requires-os:linux
+  Scenario: diagnose-79 - Naming vLLM for an error that is not vLLM's says how it was read and reports no vLLM cause
+    Given a user who pasted a Python error that has nothing to do with vLLM
+    When the user asks the CLI to diagnose that symptom as text, naming vLLM as the engine it came from
+    Then the report says the symptom was read as vLLM's, and no vLLM cause is reported

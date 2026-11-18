@@ -415,7 +415,7 @@ fn socket_lock_path(socket: &std::path::Path) -> PathBuf {
 }
 
 /// What the refusal of a path that is not a socket says about it, right after
-/// the path. The dashboard's end-to-end check (dash-56 in `dash_steps.rs`)
+/// the path. The dashboard's end-to-end check (dash-57 in `dash_steps.rs`)
 /// matches this text; it cannot import it.
 pub const NOT_A_SOCKET: &str = "exists and is not a socket";
 
