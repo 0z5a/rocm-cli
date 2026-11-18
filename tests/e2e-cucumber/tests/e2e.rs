@@ -173,6 +173,9 @@ pub struct E2eWorld {
     /// from. Consumed by [`run_rocm_with_scenario_env`] like `command_env`; `None`
     /// leaves the harness's own working directory.
     pub command_dir: Option<PathBuf>,
+    /// `(request, HTTP status)` for each server route a step called directly,
+    /// in call order, for a later Then step to judge.
+    pub route_statuses: Vec<(String, u16)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -247,6 +250,9 @@ pub struct E2eWorld {
     /// local webhook it listens on. Held here so `Drop` can kill and reap it
     /// whatever the scenario's outcome.
     pub automation_daemon: Option<e2e::automations_steps::AutomationDaemon>,
+    /// Every file of a Lemonade tree a Given planted, with its bytes, so a Then
+    /// can show a refused install left that tree exactly as it was.
+    pub planted_tree_snapshot: Option<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -260,6 +266,9 @@ struct Resolution {
     engine: String,
     feature: String,
     scenario: String,
+    /// Tagged `@requires-gpu` or `@requires-multi-gpu`, for the post-run check
+    /// that a GPU-declaring lane executed at least one of them.
+    requires_gpu: bool,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -402,6 +411,7 @@ impl Default for E2eWorld {
             expect_xfail: false,
             command_env: Vec::new(),
             command_dir: None,
+            route_statuses: Vec::new(),
             tui: None,
             chat_use_mock: false,
             comfyui_baseline_torch_stack: None,
@@ -417,6 +427,7 @@ impl Default for E2eWorld {
             recorded_descendant: None,
             dash_report_refused: None,
             automation_daemon: None,
+            planted_tree_snapshot: None,
         }
     }
 }
@@ -982,6 +993,18 @@ pub fn run_rocm_bounded(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> (String, String, i32) {
+    run_rocm_bounded_with_env(world, args, &[], timeout)
+}
+
+/// Like [`run_rocm_bounded`], but sets `envs` on the child on top of the
+/// scenario's isolated env, for a value that must not appear in the recorded
+/// argv (an endpoint API key).
+pub fn run_rocm_bounded_with_env(
+    world: &E2eWorld,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
     use std::process::Stdio;
 
     let binary = rocm_binary();
@@ -991,6 +1014,7 @@ pub fn run_rocm_bounded(
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
+    cmd.envs(envs.iter().copied());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::from(
         std::fs::File::create(&out_path).expect("stdout file"),
@@ -1184,6 +1208,37 @@ pub fn run_rocm_without_data_dir_override(
 /// Run `rocm` with the behavioral fixture established by a Given step, then
 /// consume it so it cannot leak into a later action in the same scenario.
 pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let (mut cmd, binary) = scenario_command(world, args);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    scenario_command_result(world, args, &output)
+}
+
+/// [`run_rocm_with_scenario_env`] for a run that may take long, waited for on
+/// a blocking thread instead of the one the whole suite is polled on.
+///
+/// The cucumber run is one future under `block_on` (see `main`), so a
+/// synchronous wait inside a step stops every other concurrent scenario for as
+/// long as it lasts. A fix that waits out its one-minute timeout (diagnose-68)
+/// stalled the TUI scenarios running beside it past their own wall-clock caps
+/// ("the harness left this step unpolled"). The same reason
+/// `probe_device_memory` in `serving_steps.rs` runs on `spawn_blocking`.
+pub async fn run_rocm_with_scenario_env_off_executor(
+    world: &mut E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let (mut cmd, binary) = scenario_command(world, args);
+    let output = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .unwrap_or_else(|e| panic!("the thread running {binary} failed: {e}"))
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    scenario_command_result(world, args, &output)
+}
+
+/// The `rocm` command [`run_rocm_with_scenario_env`] runs, with the scenario's
+/// fixture moved into it, and the binary's name for messages.
+fn scenario_command(world: &mut E2eWorld, args: &[&str]) -> (std::process::Command, String) {
     let binary = rocm_binary();
     // A binary given as a relative path was meant relative to this process's
     // directory, not to the scenario's, so it is made absolute before the child
@@ -1205,9 +1260,16 @@ pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (Strin
     if let Some(dir) = world.command_dir.take() {
         cmd.current_dir(dir);
     }
-    let output = cmd
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    (cmd, binary)
+}
+
+/// `(stdout, stderr, rc)` of a finished scenario command, recorded for the
+/// command-coverage report.
+fn scenario_command_result(
+    world: &E2eWorld,
+    args: &[&str],
+    output: &std::process::Output,
+) -> (String, String, i32) {
     let rc = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     record_command(world.current_scenario.as_deref(), args, rc, &stdout);
@@ -1457,6 +1519,7 @@ async fn run_suite() {
     use e2e_cucumber::expectation::{
         Expectation, ScenarioDecl, lifecycle_lane_includes, resolve, unmatched_also_run_ids,
     };
+    use e2e_cucumber::lane_verdict;
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
@@ -1516,6 +1579,19 @@ async fn run_suite() {
         "Host capability: platform={} os={} gpu={} effective_engine={}",
         cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
     );
+
+    // Refuse to run when the result could not mean anything: a probe that could
+    // not read the binary, or a lane that declares a GPU the probe did not find,
+    // would resolve every GPU scenario to skip and pass. See `lane_verdict`.
+    let preflight = lane_verdict::preflight(
+        std::env::var_os(lane_verdict::EXPECT_GPU_ENV).as_deref(),
+        cap.probe_error.as_deref(),
+        cap.has_amd_gpu,
+        &e2e_cucumber::capability::probe_facts_summary(cap),
+    )
+    .unwrap_or_else(|fatal| lane_failure(&fatal));
+    print_lane_notes(&preflight.notes);
+    let gpu_declaration = preflight.declaration;
 
     // Shared record of each scenario's resolved expectation, keyed by @id.
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
@@ -1639,6 +1715,7 @@ async fn run_suite() {
                             engine,
                             feature: feature.name.clone(),
                             scenario: scenario.name.clone(),
+                            requires_gpu: lane_verdict::needs_gpu(&decl),
                         },
                     );
                     // Two scenarios sharing an `@id` would silently overwrite each
@@ -1694,31 +1771,41 @@ async fn run_suite() {
     // OS is always collected (every platform, incl. mock); ROCm/vLLM/lemonade come
     // from the shared runtimes tree CI provides (E2E_SHARED_RUNTIMES_DIR) — absent
     // on mock (no runtime) and on local runs (per-scenario dirs already dropped),
-    // where those render as "n/a". Best-effort.
+    // where those render as "n/a". Best-effort. Collected before the lane check
+    // so that, once decided, nothing stands between it and platform.json.
     let shared = shared_runtimes_dir();
     let versions = e2e_cucumber::capability::collect_versions(shared.as_deref());
 
+    // A run with nothing to fail passes; check it executed something, and on
+    // a GPU-declaring lane something that needed the GPU. `resolutions` is empty
+    // when a cucumber `--name`/`--tags` filter replaced `filter_run`, and then
+    // which scenarios need a GPU is unknown. The verdict goes into platform.json,
+    // so the consolidated report shows a failed lane check as red.
+    let resolved: Vec<lane_verdict::ResolvedRun<'_>> = resolutions
+        .iter()
+        .map(|(id, r)| lane_verdict::ResolvedRun {
+            id,
+            feature: &r.feature,
+            scenario: &r.scenario,
+            engine: &r.engine,
+            expectation: &r.expectation,
+            needs_gpu: r.requires_gpu,
+        })
+        .collect();
+    let executed: Vec<&str> = actual.iter().map(|(id, _)| id.as_str()).collect();
+    let (post_run, manifest) =
+        lane_verdict::finish_run(cap, versions, &resolved, &executed, gpu_declaration);
+    print_lane_notes(&post_run.notes);
+
     // Write the platform.json sidecar (probed capability + every resolution,
-    // including skips) for the central report's expected-vs-actual grid.
-    let manifest = e2e_cucumber::expectation::PlatformManifest {
-        platform_slug: &cap.platform_slug,
-        capability: cap,
-        versions,
-        expectations: resolutions
-            .iter()
-            .map(|(id, r)| {
-                e2e_cucumber::expectation::ResolvedScenario::new(
-                    id,
-                    &r.feature,
-                    &r.scenario,
-                    &r.engine,
-                    &r.expectation,
-                )
-            })
-            .collect(),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let _ = std::fs::write(dir.join("platform.json"), json);
+    // including skips, + any lane failure) for the central report's grid.
+    let written = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| error.to_string())
+        .and_then(|json| {
+            std::fs::write(dir.join("platform.json"), json).map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        eprintln!("warning: could not write platform.json: {error}");
     }
 
     // Classify actual results against the matrix. A deterministic XPASS is
@@ -1763,7 +1850,7 @@ async fn run_suite() {
             "XPASS (flaky, tolerated): '{x}' passed this run; the intermittent bug remains tracked."
         );
     }
-    if !stale_xpass.is_empty() || !unexpected_fail.is_empty() {
+    if lane_verdict::run_failed(stale_xpass.len(), unexpected_fail.len(), &post_run) {
         for x in &stale_xpass {
             eprintln!(
                 "XPASS: '{x}' is expected to fail on this host but PASSED \u{2014} the bug appears \
@@ -1775,6 +1862,24 @@ async fn run_suite() {
                 "FAIL: '{f}' was expected to pass on this host but FAILED \u{2014} a regression."
             );
         }
+        if let Some(fatal) = &post_run.fatal {
+            lane_failure(fatal);
+        }
         std::process::exit(1);
+    }
+}
+
+/// Print a lane-check failure (see `lane_verdict::failure_lines`) and exit
+/// non-zero.
+fn lane_failure(message: &str) -> ! {
+    for line in e2e_cucumber::lane_verdict::failure_lines(message) {
+        eprintln!("{line}");
+    }
+    std::process::exit(1);
+}
+
+fn print_lane_notes(notes: &[String]) {
+    for note in notes {
+        eprintln!("{}", e2e_cucumber::lane_verdict::note_line(note));
     }
 }

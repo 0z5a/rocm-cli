@@ -2,9 +2,9 @@ Feature: Model serving
 
   # Interactive `rocm serve` (a terminal, not --verbose or --foreground) follows
   # download, load, and health on the status line until the server is ready or
-  # the startup wait fails. Scenario serve-61 drives it under a real PTY; it
+  # the startup wait fails. Scenario serve-63 drives it under a real PTY; it
   # needs a live engine, so it is `@requires-gpu` and runs on the GPU lanes
-  # only. serve-62 covers an engine that exits during startup on the no-GPU
+  # only. serve-64 covers an engine that exits during startup on the no-GPU
   # mock lane with a stand-in engine. The stall, deadline and engine-failed
   # branches need a controllable engine, so no lane reaches them; `decide_serve_startup` and
   # `wait_for_serve_startup` in apps/rocm/src/serve_progress.rs are their
@@ -991,19 +991,58 @@ Feature: Model serving
     And the launch's service record is left as ready
     And no background automation daemon was left behind
 
+  # An API key on a vLLM endpoint (`--require-api-key`, a public bind, or
+  # `rocm remote serve`) has to cover the whole server, not only the OpenAI `/v1`
+  # API: vLLM's own key check guards a fixed set of path prefixes, while the
+  # server also answers inference and tokenizer routes outside them. rocm-cli
+  # starts vLLM with a middleware that demands the key on every route except
+  # `GET`/`HEAD /health` and CORS preflights. The middleware itself is
+  # unit-tested on every PR (`endpoint_auth` in the vLLM engine crate); this
+  # proves it is actually wired into a real vLLM server. A full extra vLLM
+  # serve, so `@nightly` rather than per-PR: it runs after merge in the nightly
+  # runs on Instinct GPUs, which serve with vLLM: the MI300X job in
+  # `nightly.yml` and the shared GPU queue's Instinct lanes (MI350P among them).
+  # Not `@merge-queue`: the merge queue runs no lane where vLLM is the engine
+  # (the MI300X lane does not run on `merge_group`), so under that tag it
+  # skipped everywhere.
+  @id:serve-vllm-key-guards-every-route @requires-gpu @requires-engine:vllm @nightly
+  Scenario: serve-61 - A key-protected vLLM endpoint refuses keyless requests outside the OpenAI API
+    Given a managed runtime is active
+    And a model is being served on GPU behind an API key
+    When a client calls the server's routes without the key
+    Then every route outside the OpenAI API refuses the call as unauthorized
+    And the health check answers without the key
+    When the client repeats those calls with the key
+    Then every one of those calls succeeds
+
+  # A vLLM wheel built against a different torch installs and reports a version,
+  # so the inventory called it `runtime: ready` and `serve` then died deep in
+  # engine start-up. The inventory now says it is installed but not usable and
+  # names the extension (read-only, so a host whose torch needs a compat shim
+  # nobody has written yet can still read `ready`). Hermetic: a stand-in interpreter answers the probe, so
+  # no GPU, network or real vLLM is needed. The matching refusal in `serve` is
+  # covered at unit level (`serve_refuses_a_vllm_whose_extensions_do_not_import`)
+  # because reaching it end to end needs a GPU lane.
+  @id:serve-vllm-broken-extensions-reported-not-usable @requires-os:linux
+  Scenario: serve-62 - A vLLM install whose compiled extensions do not import is not reported as ready
+    Given a vLLM install whose compiled extensions do not import
+    When the user lists the engines of that install
+    Then vLLM is reported as installed but not usable
+    And the report names the extension that failed to import
+
   # Interactive `rocm serve` under a real terminal: while it waits it names the
   # command that follows the engine's log, then it exits 0 once the endpoint
   # lists the model. The named command is run, not just read: a hint that
   # points at a command that does not work would still pass a string check.
   @id:serve-interactive-startup-progress @requires-gpu
-  Scenario: serve-61 - Interactive serve shows how to follow startup and exits when the model is served
+  Scenario: serve-63 - Interactive serve shows how to follow startup and exits when the model is served
     Given a managed runtime is active
     When the user serves a model on GPU under a real terminal
     Then the terminal names the command that follows the server's log
     And the named log command runs successfully
     And the serve exits cleanly and the endpoint lists the model
 
-  # The failure side of serve-61, on the mock lane. A real engine cannot start on
+  # The failure side of serve-63, on the mock lane. A real engine cannot start on
   # a host with no GPU, so the `e2e-oom-fault-injection` build swaps the managed
   # child for a stand-in that writes one log line and exits during startup
   # (`ROCM_E2E_SIMULATE_STARTUP_EXIT`); the record, the log, the startup wait and
@@ -1012,7 +1051,7 @@ Feature: Model serving
   # lanes. The log command the failure names is run, and the record is checked,
   # so the message cannot claim a log or a settled launch that is not there.
   @id:serve-startup-exit-names-log @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-62 - An engine that exits during interactive startup fails the serve and names its log
+  Scenario: serve-64 - An engine that exits during interactive startup fails the serve and names its log
     Given a managed engine will exit while it starts
     When the user serves a model with that engine under a real terminal
     Then the serve fails saying the server process exited
