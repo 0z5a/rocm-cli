@@ -334,7 +334,7 @@ fn another_daemon_serves_blocking(socket: &Path) -> bool {
 
 /// No daemon socket on Windows (and no keeper there to ask).
 #[cfg(windows)]
-fn another_daemon_serves_blocking(socket: &Path) -> bool {
+const fn another_daemon_serves_blocking(socket: &Path) -> bool {
     let _ = socket;
     false
 }

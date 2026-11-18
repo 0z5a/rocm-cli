@@ -884,12 +884,15 @@ async fn serve_unix(
             _ = path_check.tick() => {
                 // `path_state` stats the socket path (`symlink_metadata`) on
                 // this serving task, blocking it for as long as the stat
-                // takes. Accepted on purpose: by default the socket lives in
-                // the user's local runtime or data directory
-                // (`dashboard_socket_path` in rocm-core's `config.rs`), where
-                // a stat returns at once. A socket path configured on a
-                // shared filesystem that hangs would stall this task with it;
-                // that case is tracked in ROCMAI-1152.
+                // takes. Accepted on purpose: by default
+                // (`dashboard_socket_path` in rocm-core's `config.rs`) the
+                // socket lives in `$XDG_RUNTIME_DIR`, else in
+                // `$HOME/.rocm/data/telemetry`, else in a per-user directory
+                // under the temp dir, where a stat usually returns at once.
+                // A path on a filesystem that hangs would stall this task with
+                // it: one configured there, or the `$HOME` fallback when
+                // `XDG_RUNTIME_DIR` is unset and the home directory is
+                // network-mounted. That case is tracked in ROCMAI-1152.
                 let check = match claim.path_state() {
                     PathState::Ours => Ok(()),
                     // Serving an inode nobody can reach would hold the lock,
